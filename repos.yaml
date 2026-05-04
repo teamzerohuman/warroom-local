@@ -84,8 +84,7 @@ repos:
     github: TeamFloPay/demo
     ssh_url: git@github.com:TeamFloPay/demo.git
     local_path: maps/repos/demo
-    status: planned
-    planned_by: TeamFloPay/sdk#60
+    status: active
     owner: app-demo
     description: Standalone SDK demo app after extraction from sdk/apps/demo.
     specialist:
@@ -109,8 +108,7 @@ repos:
     github: TeamFloPay/docs
     ssh_url: git@github.com:TeamFloPay/docs.git
     local_path: maps/repos/docs
-    status: planned
-    planned_by: TeamFloPay/sdk#60
+    status: active
     owner: app-docs
     description: Standalone SDK documentation site after extraction from sdk/apps/docs.
     specialist:
@@ -133,8 +131,7 @@ repos:
     github: TeamFloPay/dashboard
     ssh_url: git@github.com:TeamFloPay/dashboard.git
     local_path: maps/repos/dashboard
-    status: planned
-    planned_by: TeamFloPay/sdk#60
+    status: active
     owner: app-dashboard
     description: Standalone dashboard app after extraction from sdk/apps/dashboard.
     specialist:
@@ -156,8 +153,7 @@ repos:
     github: TeamFloPay/landing
     ssh_url: git@github.com:TeamFloPay/landing.git
     local_path: maps/repos/landing
-    status: planned
-    planned_by: TeamFloPay/sdk#60
+    status: active
     owner: app-landing
     description: Standalone marketing site after extraction from sdk/apps/landing.
     specialist:

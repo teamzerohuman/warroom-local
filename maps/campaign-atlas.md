@@ -18,10 +18,10 @@ War Room owns coordination. Child repositories own code.
 | `TeamFloPay/sdk` | active | `maps/repos/sdk` | SDK Sergeant | SDK packages and publish workflow. |
 | `TeamFloPay/backend` | active | `maps/repos/backend` | Backend Sergeant | Central API and server-side application. |
 | `TeamFloPay/infra` | active | `maps/repos/infra` | Infra Sergeant | Live infrastructure and operational config. |
-| `TeamFloPay/demo` | planned | `maps/repos/demo` | Demo Sergeant | Created by TeamFloPay/sdk#60. |
-| `TeamFloPay/docs` | planned | `maps/repos/docs` | Docs Sergeant | Created by TeamFloPay/sdk#60. |
-| `TeamFloPay/dashboard` | planned | `maps/repos/dashboard` | Dashboard Sergeant | Created by TeamFloPay/sdk#60. |
-| `TeamFloPay/landing` | planned | `maps/repos/landing` | Landing Sergeant | Created by TeamFloPay/sdk#60. |
+| `TeamFloPay/demo` | active | `maps/repos/demo` | Demo Sergeant | Standalone SDK demo app. |
+| `TeamFloPay/docs` | active | `maps/repos/docs` | Docs Sergeant | Standalone SDK docs site. |
+| `TeamFloPay/dashboard` | active | `maps/repos/dashboard` | Dashboard Sergeant | Standalone dashboard app. |
+| `TeamFloPay/landing` | active | `maps/repos/landing` | Landing Sergeant | Standalone marketing site. |
 
 ## Specialist Context
 
@@ -58,7 +58,6 @@ War Room owns coordination. Child repositories own code.
 ### Demo Sergeant
 
 - Repo: `TeamFloPay/demo`
-- Status: planned by TeamFloPay/sdk#60.
 - Focus: SDK verification, checkout demos, Playwright coverage, local SDK linking after extraction.
 
 <!-- warroom:notes:start repo=demo -->
@@ -68,7 +67,6 @@ War Room owns coordination. Child repositories own code.
 ### Docs Sergeant
 
 - Repo: `TeamFloPay/docs`
-- Status: planned by TeamFloPay/sdk#60.
 - Focus: SDK documentation, examples, API reference, guide content.
 
 <!-- warroom:notes:start repo=docs -->
@@ -78,7 +76,6 @@ War Room owns coordination. Child repositories own code.
 ### Dashboard Sergeant
 
 - Repo: `TeamFloPay/dashboard`
-- Status: planned by TeamFloPay/sdk#60.
 - Focus: dashboard app and billing/admin workflows.
 
 <!-- warroom:notes:start repo=dashboard -->
@@ -88,7 +85,6 @@ War Room owns coordination. Child repositories own code.
 ### Landing Sergeant
 
 - Repo: `TeamFloPay/landing`
-- Status: planned by TeamFloPay/sdk#60.
 - Focus: marketing site and public product pages.
 
 <!-- warroom:notes:start repo=landing -->
