@@ -1,0 +1,174 @@
+version: 1
+defaults:
+  owner: TeamFloPay
+  clone_protocol: ssh
+  default_branch: main
+  local_root: maps/repos
+
+repos:
+  - id: sdk
+    name: sdk
+    github: TeamFloPay/sdk
+    ssh_url: git@github.com:TeamFloPay/sdk.git
+    local_path: maps/repos/sdk
+    status: active
+    owner: sdk
+    description: SDK packages published as @flopay/*.
+    specialist:
+      name: SDK Sergeant
+      context:
+        frameworks:
+          - TypeScript
+          - pnpm
+          - Turborepo
+          - tsup
+        domains:
+          - SDK packages
+          - package publishing
+          - demo compatibility
+        resources:
+          - github-cli
+          - npm-docs
+          - typescript-docs
+
+  - id: backend
+    name: backend
+    github: TeamFloPay/backend
+    ssh_url: git@github.com:TeamFloPay/backend.git
+    local_path: maps/repos/backend
+    status: active
+    owner: backend
+    description: Central API and server-side application.
+    specialist:
+      name: Backend Sergeant
+      context:
+        frameworks:
+          - NestJS
+          - TypeScript
+          - PostgreSQL
+        domains:
+          - billing API
+          - checkout orchestration
+          - payment provider integrations
+        resources:
+          - github-cli
+          - nestjs-docs
+          - stripe-docs
+
+  - id: infra
+    name: infra
+    github: TeamFloPay/infra
+    ssh_url: git@github.com:TeamFloPay/infra.git
+    local_path: maps/repos/infra
+    status: active
+    owner: infra
+    description: Live infrastructure and operational configuration.
+    specialist:
+      name: Infra Sergeant
+      context:
+        frameworks:
+          - Terraform
+          - Railway
+          - Cloudflare
+        domains:
+          - infrastructure safety
+          - deployment wiring
+          - DNS
+        resources:
+          - github-cli
+          - railway-docs
+          - cloudflare-docs
+
+  - id: demo
+    name: demo
+    github: TeamFloPay/demo
+    ssh_url: git@github.com:TeamFloPay/demo.git
+    local_path: maps/repos/demo
+    status: planned
+    planned_by: TeamFloPay/sdk#60
+    owner: app-demo
+    description: Standalone SDK demo app after extraction from sdk/apps/demo.
+    specialist:
+      name: Demo Sergeant
+      context:
+        frameworks:
+          - Next.js
+          - Playwright
+          - React
+        domains:
+          - SDK verification
+          - checkout demos
+          - local SDK linking
+        resources:
+          - github-cli
+          - nextjs-docs
+          - playwright-docs
+
+  - id: docs
+    name: docs
+    github: TeamFloPay/docs
+    ssh_url: git@github.com:TeamFloPay/docs.git
+    local_path: maps/repos/docs
+    status: planned
+    planned_by: TeamFloPay/sdk#60
+    owner: app-docs
+    description: Standalone SDK documentation site after extraction from sdk/apps/docs.
+    specialist:
+      name: Docs Sergeant
+      context:
+        frameworks:
+          - Next.js
+          - Fumadocs
+          - MDX
+        domains:
+          - SDK documentation
+          - examples
+          - API reference
+        resources:
+          - github-cli
+          - nextjs-docs
+
+  - id: dashboard
+    name: dashboard
+    github: TeamFloPay/dashboard
+    ssh_url: git@github.com:TeamFloPay/dashboard.git
+    local_path: maps/repos/dashboard
+    status: planned
+    planned_by: TeamFloPay/sdk#60
+    owner: app-dashboard
+    description: Standalone dashboard app after extraction from sdk/apps/dashboard.
+    specialist:
+      name: Dashboard Sergeant
+      context:
+        frameworks:
+          - Next.js
+          - React
+        domains:
+          - billing dashboard
+          - admin workflows
+        resources:
+          - github-cli
+          - nextjs-docs
+          - stripe-docs
+
+  - id: landing
+    name: landing
+    github: TeamFloPay/landing
+    ssh_url: git@github.com:TeamFloPay/landing.git
+    local_path: maps/repos/landing
+    status: planned
+    planned_by: TeamFloPay/sdk#60
+    owner: app-landing
+    description: Standalone marketing site after extraction from sdk/apps/landing.
+    specialist:
+      name: Landing Sergeant
+      context:
+        frameworks:
+          - Next.js
+          - React
+        domains:
+          - marketing site
+          - public product pages
+        resources:
+          - github-cli
+          - nextjs-docs

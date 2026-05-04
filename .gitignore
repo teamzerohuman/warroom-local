@@ -1,0 +1,25 @@
+.DS_Store
+node_modules/
+dist/
+coverage/
+
+# Local secrets and machine-specific config.
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.crt
+
+# Local command artifacts.
+.warroom/runs/*
+!.warroom/runs/.gitkeep
+
+# Child repositories are cloned locally and committed in their own repos.
+maps/repos/*
+!maps/repos/.gitkeep
+
+# Tool caches.
+.turbo/
+.vitest/
+npm-debug.log*

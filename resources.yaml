@@ -1,0 +1,56 @@
+version: 1
+
+resources:
+  - id: github-cli
+    type: cli
+    name: GitHub CLI
+    description: Local GitHub issue, PR, repo, and project operations through gh.
+    docs_url: https://cli.github.com/manual/
+
+  - id: typescript-docs
+    type: docs
+    name: TypeScript Documentation
+    description: Public TypeScript language and compiler documentation.
+    docs_url: https://www.typescriptlang.org/docs/
+
+  - id: npm-docs
+    type: docs
+    name: npm Documentation
+    description: Public npm package manager documentation.
+    docs_url: https://docs.npmjs.com/
+
+  - id: nestjs-docs
+    type: docs
+    name: NestJS Documentation
+    description: Public NestJS framework documentation.
+    docs_url: https://docs.nestjs.com/
+
+  - id: stripe-docs
+    type: docs
+    name: Stripe Documentation
+    description: Public Stripe API and integration documentation.
+    docs_url: https://docs.stripe.com/
+
+  - id: nextjs-docs
+    type: docs
+    name: Next.js Documentation
+    description: Public Next.js framework documentation.
+    docs_url: https://nextjs.org/docs
+
+  - id: playwright-docs
+    type: docs
+    name: Playwright Documentation
+    description: Public Playwright testing documentation.
+    docs_url: https://playwright.dev/docs/intro
+
+  - id: railway-docs
+    type: docs
+    name: Railway Documentation
+    description: Public Railway platform documentation.
+    docs_url: https://docs.railway.com/
+
+  - id: cloudflare-docs
+    type: docs
+    name: Cloudflare Documentation
+    description: Public Cloudflare platform documentation.
+    docs_url: https://developers.cloudflare.com/
