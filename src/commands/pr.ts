@@ -12,6 +12,29 @@ export type PrOptions = {
   confirm?: boolean;
   base?: string;
   confirmStatus?: boolean;
+  summary?: string;
+  postSummary?: boolean;
+  confirmSummary?: boolean;
+};
+
+export type MergeReadiness = {
+  mergeStateStatus: string | null;
+  reviewDecision: string | null;
+  isDraft: boolean | null;
+  checks: Array<{
+    name: string;
+    state: string;
+  }>;
+  blocked: string[];
+};
+
+export type SummaryPostResult = {
+  target: 'pr' | 'issue';
+  ref: string;
+  applied: boolean;
+  url: string | null;
+  reason: string | null;
+  error: string | null;
 };
 
 export type PrPlanResult = {
@@ -21,6 +44,10 @@ export type PrPlanResult = {
   adapterCommand: string | null;
   action: 'engage' | 'review' | 'merge';
   campaignStatus: CampaignStatusSetResult | null;
+  mergeReadiness?: MergeReadiness;
+  summary?: string;
+  summaryPosts?: SummaryPostResult[];
+  merged?: boolean;
 };
 
 function ghJson<T>(args: string[], fallback: T): T {
@@ -45,6 +72,143 @@ function summarizeList<T>(values: T[] | undefined, map: (value: T) => string, li
   const rows = (values ?? []).slice(0, limit).map(map);
   if ((values ?? []).length > limit) rows.push(`[${(values ?? []).length - limit} more omitted]`);
   return rows.length ? rows.join('\n') : 'none';
+}
+
+function ghComment(args: string[]): { url: string | null; error: string | null } {
+  const result = spawnSync('gh', args, { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return { url: null, error: result.stderr.trim() || `gh exited ${result.status ?? 'unknown'}` };
+  }
+  return { url: result.stdout.trim() || null, error: null };
+}
+
+function buildMergeReadiness(pr: {
+  mergeStateStatus?: string;
+  reviewDecision?: string;
+  isDraft?: boolean;
+  statusCheckRollup?: Array<{ name?: string; status?: string; conclusion?: string; workflowName?: string }>;
+}): MergeReadiness {
+  const checks = (pr.statusCheckRollup ?? [])
+    .filter((check) => check.name || check.status || check.conclusion || check.workflowName)
+    .map((check) => ({
+      name: check.workflowName ? `${check.name ?? 'unknown'} (${check.workflowName})` : (check.name ?? 'unknown'),
+      state: check.conclusion ?? check.status ?? 'unknown',
+    }));
+  const blocked: string[] = [];
+  const mergeStateStatus = pr.mergeStateStatus ?? null;
+  const reviewDecision = pr.reviewDecision ?? null;
+
+  if (pr.isDraft === true) blocked.push('PR is still marked as draft.');
+  if (mergeStateStatus && ['BLOCKED', 'BEHIND', 'DIRTY', 'DRAFT', 'UNKNOWN'].includes(mergeStateStatus)) {
+    blocked.push(`Merge state is ${mergeStateStatus}.`);
+  }
+  if (reviewDecision && ['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes(reviewDecision)) {
+    blocked.push(`Review decision is ${reviewDecision}.`);
+  }
+
+  for (const check of checks) {
+    if (['ACTION_REQUIRED', 'CANCELLED', 'FAILURE', 'TIMED_OUT'].includes(check.state)) {
+      blocked.push(`Check failed: ${check.name} (${check.state}).`);
+    } else if (!['COMPLETED', 'SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(check.state)) {
+      blocked.push(`Check is not complete: ${check.name} (${check.state}).`);
+    }
+  }
+
+  return {
+    mergeStateStatus,
+    reviewDecision,
+    isDraft: typeof pr.isDraft === 'boolean' ? pr.isDraft : null,
+    checks,
+    blocked,
+  };
+}
+
+function buildVictorySummary(
+  prRef: string,
+  issueRef: string | undefined,
+  pr: { title?: string; url?: string; headRefName?: string; baseRefName?: string },
+  readiness: MergeReadiness,
+  operatorSummary: string | undefined
+) {
+  const defaultOutcome =
+    readiness.blocked.length === 0
+      ? 'Ready for final merge and cleanup through `warroom pr merge`.'
+      : 'Preflight is blocked. Resolve merge-readiness blockers before marking victory.';
+  const lines = [
+    '## Victory summary',
+    '',
+    `PR: ${prRef}`,
+    `Title: ${pr.title ?? 'unknown'}`,
+    `URL: ${pr.url ?? 'unknown'}`,
+    `Branch: ${pr.headRefName ?? 'unknown'} -> ${pr.baseRefName ?? 'unknown'}`,
+  ];
+
+  if (issueRef) lines.push(`Linked issue: ${issueRef}`);
+
+  lines.push(
+    '',
+    'Outcome:',
+    operatorSummary ?? defaultOutcome,
+    '',
+    'Merge readiness:',
+    readiness.blocked.length === 0 ? 'No blockers detected by War Room preflight.' : readiness.blocked.map((blocker) => `- ${blocker}`).join('\n'),
+    '',
+    'Checks:',
+    readiness.checks.length === 0 ? 'No status checks were returned by GitHub.' : readiness.checks.map((check) => `- ${check.name}: ${check.state}`).join('\n')
+  );
+
+  return lines.join('\n');
+}
+
+function buildSummaryPostPlan(options: PrOptions, summary: string, readiness: MergeReadiness): SummaryPostResult[] {
+  if (!options.pr || !options.postSummary) return [];
+
+  const targets: Array<{ target: 'pr' | 'issue'; ref: string }> = [{ target: 'pr', ref: options.pr }];
+  if (options.issue) targets.push({ target: 'issue', ref: options.issue });
+
+  if (!options.confirmSummary) {
+    return targets.map((target) => ({
+      ...target,
+      applied: false,
+      url: null,
+      reason: 'Pass --confirm-summary to post victory summary comments.',
+      error: null,
+    }));
+  }
+
+  if (readiness.blocked.length > 0) {
+    return targets.map((target) => ({
+      ...target,
+      applied: false,
+      url: null,
+      reason: 'Merge readiness blockers are present.',
+      error: null,
+    }));
+  }
+
+  return targets.map((target) => {
+    if (target.target === 'pr') {
+      const ref = parsePrRef(target.ref);
+      const result = ghComment(['pr', 'comment', String(ref.number), '--repo', ref.repo, '--body', summary]);
+      return {
+        ...target,
+        applied: result.error === null,
+        url: result.url,
+        reason: null,
+        error: result.error,
+      };
+    }
+
+    const ref = parseIssueRef(target.ref);
+    const result = ghComment(['issue', 'comment', String(ref.number), '--repo', ref.repo, '--body', summary]);
+    return {
+      ...target,
+      applied: result.error === null,
+      url: result.url,
+      reason: null,
+      error: result.error,
+    };
+  });
 }
 
 export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanResult {
@@ -174,43 +338,92 @@ export function runPrReview(workspaceRoot: string, options: PrOptions): PrPlanRe
 export function runPrMerge(workspaceRoot: string, options: PrOptions): PrPlanResult {
   if (!options.pr) throw new Error('warroom pr merge requires --pr owner/repo#number.');
   const ref = parsePrRef(options.pr);
-  const pr = ghJson<{ title?: string; url?: string; mergeStateStatus?: string; reviewDecision?: string }>(
-    ['pr', 'view', String(ref.number), '--repo', ref.repo, '--json', 'title,url,mergeStateStatus,reviewDecision'],
+  const pr = ghJson<{
+    title?: string;
+    url?: string;
+    mergeStateStatus?: string;
+    reviewDecision?: string;
+    headRefName?: string;
+    baseRefName?: string;
+    isDraft?: boolean;
+    statusCheckRollup?: Array<{ name?: string; status?: string; conclusion?: string; workflowName?: string }>;
+  }>(
+    [
+      'pr',
+      'view',
+      String(ref.number),
+      '--repo',
+      ref.repo,
+      '--json',
+      'title,url,mergeStateStatus,reviewDecision,headRefName,baseRefName,isDraft,statusCheckRollup',
+    ],
     {}
   );
+  const readiness = buildMergeReadiness(pr);
+  const summary = buildVictorySummary(options.pr, options.issue, pr, readiness, options.summary);
   const prompt = [
     `War Room PR merge preflight for ${options.pr}`,
     '',
     `Title: ${pr.title ?? 'unknown'}`,
     `URL: ${pr.url ?? `https://github.com/${ref.repo}/pull/${ref.number}`}`,
+    `Branch: ${pr.headRefName ?? 'unknown'} -> ${pr.baseRefName ?? 'unknown'}`,
     `Merge state: ${pr.mergeStateStatus ?? 'unknown'}`,
     `Review decision: ${pr.reviewDecision ?? 'unknown'}`,
+    `Draft: ${pr.isDraft === undefined ? 'unknown' : pr.isDraft ? 'yes' : 'no'}`,
+    '',
+    'Readiness blockers:',
+    readiness.blocked.length ? readiness.blocked.map((blocker) => `- ${blocker}`).join('\n') : 'none',
+    '',
+    'Checks:',
+    readiness.checks.length ? readiness.checks.map((check) => `- ${check.name}: ${check.state}`).join('\n') : 'none',
     '',
     'Required merge checks:',
     '- Confirm all review and CodeRabbit feedback loops are resolved.',
     '- Confirm validation status and target branch.',
     '- Merge only after explicit confirmation.',
     '- Post issue/PR summary and return local checkout to the default branch safely.',
+    '',
+    'Victory summary:',
+    summary,
   ].join('\n');
-  const artifact = options.writeArtifact
-    ? createRunArtifact(workspaceRoot, 'pr-merge', {
-        'prompt.md': prompt,
-        'input.json': JSON.stringify(options, null, 2),
-      })
-    : null;
+  let merged = false;
 
   if (options.confirm) {
+    if (readiness.blocked.length > 0) throw new Error(`PR is not merge-ready: ${readiness.blocked.join(' ')}`);
     const result = spawnSync(
       'gh',
       ['pr', 'merge', String(ref.number), '--repo', ref.repo, '--squash', '--delete-branch'],
       { stdio: 'inherit' }
     );
     if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);
+    merged = true;
   }
 
+  const summaryPosts = buildSummaryPostPlan(options, summary, readiness);
   const campaignStatus = options.issue
-    ? setCampaignStatus(options.issue, 'victory', { confirm: options.confirmStatus })
+    ? setCampaignStatus(options.issue, 'victory', { confirm: options.confirmStatus && readiness.blocked.length === 0 })
+    : null;
+  const artifact = options.writeArtifact
+    ? createRunArtifact(workspaceRoot, 'pr-merge', {
+        'prompt.md': prompt,
+        'input.json': JSON.stringify(options, null, 2),
+        'pr.json': JSON.stringify(pr, null, 2),
+        'readiness.json': JSON.stringify(readiness, null, 2),
+        'summary.md': summary,
+        'summary-posts.json': JSON.stringify(summaryPosts, null, 2),
+      })
     : null;
 
-  return { prompt, artifact, launched: false, adapterCommand: null, action: 'merge', campaignStatus };
+  return {
+    prompt,
+    artifact,
+    launched: false,
+    adapterCommand: null,
+    action: 'merge',
+    campaignStatus,
+    mergeReadiness: readiness,
+    summary,
+    summaryPosts,
+    merged,
+  };
 }

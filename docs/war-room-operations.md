@@ -39,6 +39,8 @@ Workflow commands also understand the Campaign Map:
 
 `warroom pr review` handoffs include the PR body, changed files, latest reviews, comments, and check rollup so the launched adapter starts from scoped review context instead of only the PR description.
 
+`warroom pr merge` handoffs include merge state, review decision, draft state, status checks, readiness blockers, and a generated victory summary. `--confirm` is still required for the merge itself. `--post-summary --confirm-summary` is required before War Room posts victory summary comments to GitHub. `--confirm-status` moves the linked issue to `victory` only when the merge-readiness preflight is clear.
+
 `warroom commit create` summarizes changed files, runs requested validation commands from the owning child repo, and writes ignored run artifacts when `--write-artifact` is present. A confirmed commit is still gated by `--confirm`; staging all files is gated separately by `--all`.
 
 ## Recovery

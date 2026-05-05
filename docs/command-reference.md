@@ -21,7 +21,7 @@ warroom issue create
 warroom issue fortify
 warroom pr engage --issue TeamFloPay/infra#4
 warroom pr review --pr TeamFloPay/warroom#1 --issue TeamFloPay/infra#4
-warroom pr merge --pr TeamFloPay/warroom#1 --issue TeamFloPay/infra#4
+warroom pr merge --pr TeamFloPay/warroom#1 --issue TeamFloPay/infra#4 --write-artifact
 warroom commit create --repo sdk --validate "npm test" --write-artifact
 warroom abort --print-recovery
 warroom dev status
@@ -44,7 +44,7 @@ warroom pr review --help
 - `campaign status` previews issue status movement unless `--confirm` is present. Moving to `blockaded` requires `--reason`.
 - Issue and PR handoff commands print scoped prompts by default. Add `--launch` to start the configured LLM adapter.
 - Workflow status movement is guarded separately with `--confirm-status`.
-- `pr merge` only merges when `--confirm` is present.
+- `pr merge` only merges when `--confirm` is present. Victory summary comments require `--post-summary --confirm-summary`.
 - `commit create` only commits when `--confirm` is present. `--all` is also explicit, and validation commands must pass before a confirmed commit proceeds.
 - `abort` never resets, cleans, checks out, or deletes branches. `--stash` requires `--confirm`.
 
@@ -66,7 +66,7 @@ warroom pr review --help
 
 `warroom issue create` and `warroom issue fortify` are explicit post-MVP placeholders tracked by TeamFloPay/infra#7.
 
-`warroom pr engage`, `warroom pr review`, and `warroom pr merge` provide preflight plans and scoped handoffs. `pr review` includes PR files, comments, latest reviews, and check state in the handoff. `pr engage --confirm-status` moves the issue to `battlefield-active`; `pr review --issue ... --confirm-status` moves it to `skirmish`; `pr merge --issue ... --confirm-status` moves it to `victory`. Full code-writing automation remains human-directed through the launched adapter.
+`warroom pr engage`, `warroom pr review`, and `warroom pr merge` provide preflight plans and scoped handoffs. `pr review` includes PR files, comments, latest reviews, and check state in the handoff. `pr merge` includes merge state, review decision, draft state, status checks, readiness blockers, and a generated victory summary. Add `--summary <text>` to customize the summary, `--write-artifact` to store `prompt.md`, `pr.json`, `readiness.json`, `summary.md`, and `summary-posts.json`, and `--post-summary --confirm-summary` to post comments to the PR plus linked issue. `pr engage --confirm-status` moves the issue to `battlefield-active`; `pr review --issue ... --confirm-status` moves it to `skirmish`; `pr merge --issue ... --confirm-status` moves it to `victory` only when no merge-readiness blockers are detected. Full code-writing automation remains human-directed through the launched adapter.
 
 `warroom commit create` inspects a mapped child repo, summarizes changed files, proposes a conventional commit message, optionally runs repeatable `--validate <command>` checks from the target repo, and refuses to proceed when other child repos are dirty. Add `--write-artifact` to write `input.json`, `result.json`, `summary.md`, `status.txt`, and `validation.json` under ignored `.warroom/runs/*`. A confirmed commit without `--all` requires the target repo to have only staged changes.
 

@@ -27,6 +27,7 @@ Real provider keys and local secrets belong in `.env.local`, the developer's con
 npm run warroom -- issue triage --issue TeamFloPay/infra#4 --write-artifact
 npm run warroom -- pr engage --issue TeamFloPay/infra#4 --write-artifact
 npm run warroom -- pr review --pr TeamFloPay/warroom#1 --write-artifact
+npm run warroom -- pr merge --pr TeamFloPay/warroom#1 --issue TeamFloPay/infra#4 --write-artifact
 ```
 
 Artifacts are local audit/debug files. GitHub comments should contain useful summaries, not local artifact paths.

@@ -80,6 +80,16 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   output(`PR ${result.action}: ${result.launched ? 'launched' : 'preflight only'}`);
   if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
+  if (result.mergeReadiness) {
+    output(`Merge readiness: ${result.mergeReadiness.blocked.length === 0 ? 'clear' : 'blocked'}`);
+    for (const blocker of result.mergeReadiness.blocked) output(`blocked: ${blocker}`);
+  }
+  if (result.merged !== undefined) output(`Merged: ${result.merged ? 'yes' : 'no'}`);
+  for (const post of result.summaryPosts ?? []) {
+    const state = post.applied ? 'posted' : post.error ? 'failed' : 'planned';
+    output(`Summary ${post.target}: ${state} ${post.ref}${post.url ? ` ${post.url}` : ''}${post.reason ? ` (${post.reason})` : ''}`);
+    if (post.error) output(`summary error: ${post.error}`);
+  }
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
@@ -456,14 +466,30 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     .option('--issue <owner/repo#number>', 'Linked issue to move to victory.')
     .option('--confirm', 'Actually run gh pr merge --squash --delete-branch.')
     .option('--confirm-status', 'Move the linked issue to victory on the Campaign Map.')
+    .option('--summary <text>', 'Victory summary to include in local artifacts and optional comments.')
+    .option('--post-summary', 'Plan or post victory summary comments to the PR and linked issue.')
+    .option('--confirm-summary', 'Actually post victory summary comments. Requires --post-summary.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { pr: string; issue?: string; confirm?: boolean; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+    .action((opts: {
+      pr: string;
+      issue?: string;
+      confirm?: boolean;
+      confirmStatus?: boolean;
+      summary?: string;
+      postSummary?: boolean;
+      confirmSummary?: boolean;
+      writeArtifact?: boolean;
+      json?: boolean;
+    }) => {
       const result = runPrMerge(workspaceRoot, {
         pr: opts.pr,
         issue: opts.issue,
         confirm: opts.confirm,
         confirmStatus: opts.confirmStatus,
+        summary: opts.summary,
+        postSummary: opts.postSummary,
+        confirmSummary: opts.confirmSummary,
         writeArtifact: opts.writeArtifact,
       });
       if (opts.json) {
