@@ -114,7 +114,13 @@ function buildTriagePrompt(ref: IssueRef) {
 }
 
 export function runIssueNext(workspaceRoot: string, label = 'ready-to-engage') {
-  const issues = listCampaignIssuesByStatus('ready-to-engage').map((issue) => ({
+  const issues = listIssuesByCampaignStatus('ready-to-engage');
+  if (issues.length > 0) return { status: 'ready-to-engage', source: 'campaign' as const, issues };
+  return listIssuesByLabel(workspaceRoot, label);
+}
+
+function listIssuesByCampaignStatus(status: 'needs-triage' | 'ready-to-engage') {
+  return listCampaignIssuesByStatus(status).map((issue) => ({
     repo: issue.repo,
     number: issue.number,
     title: issue.title,
@@ -123,14 +129,15 @@ export function runIssueNext(workspaceRoot: string, label = 'ready-to-engage') {
     status: issue.status,
     projectItemId: issue.projectItemId,
   }));
-
-  if (issues.length > 0) return { status: 'ready-to-engage', source: 'campaign' as const, issues };
-  return listIssuesByLabel(workspaceRoot, label);
 }
 
 export function runIssueTriage(workspaceRoot: string, options: IssueTriageOptions = {}): IssueListResult | IssueHandoffResult {
   const label = options.label ?? 'needs-triage';
-  if (!options.issue) return listIssuesByLabel(workspaceRoot, label);
+  if (!options.issue) {
+    const issues = listIssuesByCampaignStatus('needs-triage');
+    if (issues.length > 0) return { status: 'needs-triage', source: 'campaign' as const, issues };
+    return listIssuesByLabel(workspaceRoot, label);
+  }
 
   const ref = parseIssueRef(options.issue);
   const prompt = buildTriagePrompt(ref);

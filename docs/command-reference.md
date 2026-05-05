@@ -60,7 +60,7 @@ warroom pr review --help
 
 `warroom maps assign` validates or updates Sergeant/resource assignments. Use `--repo`, `--sergeant`, `--add-resource`, and `--remove-resource` for targeted edits. Pass `--write` to update `repos.yaml` and regenerate `maps/campaign-atlas.md`; protected notes blocks are preserved.
 
-`warroom issue triage` lists open issues with the `needs-triage` label by default. With `--issue owner/repo#number`, it builds a scoped handoff prompt and can write `.warroom/runs/*` artifacts. Add `--mark-ready --confirm-status` after a successful triage to move the issue to `ready-to-engage`.
+`warroom issue triage` lists Campaign Map items in `needs-triage`. If the project query returns no items, it falls back to open issues with the `needs-triage` label. With `--issue owner/repo#number`, it builds a scoped handoff prompt and can write `.warroom/runs/*` artifacts. Add `--mark-ready --confirm-status` after a successful triage to move the issue to `ready-to-engage`.
 
 `warroom issue next` lists Campaign Map items in `ready-to-engage`. If the project query returns no items, it falls back to open issues with the `ready-to-engage` label.
 

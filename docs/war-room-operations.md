@@ -30,6 +30,7 @@ Use `warroom campaign status-check` to validate board status options, `warroom c
 Workflow commands also understand the Campaign Map:
 
 - `warroom issue next` reads `ready-to-engage` project items first.
+- `warroom issue triage` reads `needs-triage` project items first.
 - `warroom issue triage --mark-ready --confirm-status` moves work to `ready-to-engage`.
 - `warroom pr engage --confirm-status` moves work to `battlefield-active`.
 - `warroom pr review --issue ... --confirm-status` moves work to `skirmish`.
