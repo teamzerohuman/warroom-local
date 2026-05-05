@@ -9,6 +9,9 @@ warroom --help
 warroom doctor
 warroom bootstrap --dry-run
 warroom sync --report
+warroom campaign status-check
+warroom campaign labels
+warroom campaign status --issue TeamFloPay/infra#4 --status battlefield-active
 warroom maps study
 warroom maps assign --check
 warroom issue triage
@@ -37,6 +40,8 @@ warroom pr review --help
 
 - `bootstrap --dry-run` previews clone actions. Without `--dry-run`, missing active repos are cloned under ignored `maps/repos/*`.
 - `sync --report` does not fetch or pull. Without `--report`, sync skips dirty repos and only fast-forwards clean checkouts.
+- `campaign labels --apply` creates missing repo labels only when `--confirm` is also present.
+- `campaign status` previews issue status movement unless `--confirm` is present. Moving to `blockaded` requires `--reason`.
 - Issue and PR handoff commands print scoped prompts by default. Add `--launch` to start the configured LLM adapter.
 - `pr merge` only merges when `--confirm` is present.
 - `commit create` only commits when `--confirm` is present. `--all` is also explicit.
@@ -45,6 +50,12 @@ warroom pr review --help
 ## Command Notes
 
 `warroom doctor` validates files, `repos.yaml`, `resources.yaml`, resource references, LLM adapter shape, local repo health, local tool availability including `gh`, and Campaign Map label presence. Label fixes are printed as a reviewed create plan; doctor does not mutate labels.
+
+`warroom campaign status-check` validates the Campaign Map Status field options: `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`.
+
+`warroom campaign labels` checks matching workflow labels across mapped repos. Add `--apply --confirm` to create missing labels.
+
+`warroom campaign status` previews or applies issue movement on the Campaign Map. Use `--confirm` to mutate the board.
 
 `warroom maps assign` validates or updates Sergeant/resource assignments. Use `--repo`, `--sergeant`, `--add-resource`, and `--remove-resource` for targeted edits. Pass `--write` to update `repos.yaml` and regenerate `maps/campaign-atlas.md`; protected notes blocks are preserved.
 

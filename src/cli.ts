@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { runAbort, type AbortResult } from './commands/abort.js';
 import { runBootstrap, type BootstrapResult } from './commands/bootstrap.js';
+import { runCampaignLabels, runCampaignStatus, runCampaignStatusCheck } from './commands/campaign.js';
 import { runCommitCreate, type CommitCreateResult } from './commands/commit-create.js';
 import {
   linkSdkToDemo,
@@ -18,6 +19,7 @@ import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js'
 import { runMapsStudy } from './commands/maps-study.js';
 import { runPrEngage, runPrMerge, runPrReview, type PrPlanResult } from './commands/pr.js';
 import { runSync, type SyncResult } from './commands/sync.js';
+import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
 
 type Output = (text: string) => void;
 
@@ -91,6 +93,33 @@ function printAbort(output: Output, result: AbortResult) {
     output(`${repo.repo}: ${repo.checkedOut ? 'present' : 'missing'} ${repo.branch ?? 'no-branch'}@${repo.headSha ?? 'unknown'}${repo.dirty ? ' dirty' : ' clean'}`);
     for (const command of repo.recoveryCommands) output(`  ${command}`);
   }
+}
+
+function printCampaignLabels(output: Output, result: ReturnType<typeof runCampaignLabels>) {
+  output(`Campaign labels: ${result.errors.length > 0 ? 'check failed' : result.missing.length === 0 ? 'ok' : `${result.missing.length} missing`}`);
+  if ('applied' in result && 'created' in result && Array.isArray(result.created)) {
+    output(`Applied: ${result.applied ? 'yes' : 'no'} (${result.created.length} created)`);
+  }
+  for (const missing of result.missing) output(`missing ${missing.label} in ${missing.repo}`);
+  for (const command of result.createPlan) output(`create plan: ${command}`);
+  for (const error of result.errors) output(`error ${error.repo}: ${error.detail}`);
+}
+
+function printCampaignStatusCheck(output: Output, result: ReturnType<typeof runCampaignStatusCheck>) {
+  output(`Campaign statuses: ${result.errors.length > 0 ? 'check failed' : result.missing.length === 0 && result.unexpected.length === 0 ? 'ok' : 'needs attention'}`);
+  output(`Project: ${result.projectId ?? 'unknown'}`);
+  output(`Status field: ${result.statusFieldId ?? 'unknown'}`);
+  for (const option of result.options) output(`option ${option.name} (${option.id})`);
+  for (const missing of result.missing) output(`missing status ${missing}`);
+  for (const unexpected of result.unexpected) output(`unexpected status ${unexpected}`);
+  for (const error of result.errors) output(`error: ${error}`);
+}
+
+function printCampaignStatus(output: Output, result: ReturnType<typeof runCampaignStatus>) {
+  output(`Campaign status: ${result.applied ? 'updated' : 'planned'} ${result.issue} -> ${result.status}`);
+  output(`Project item: ${result.projectItemId}`);
+  output(`Option: ${result.optionId}`);
+  if (result.reason) output(`Reason: ${result.reason}`);
 }
 
 function formatRepoLine(label: string, repo: DevStatus['sdk']) {
@@ -176,6 +205,9 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
       }
       output(`LLM adapter: ${result.env.adapter ?? 'unset'}${result.env.adapterSupported ? '' : ' (unsupported)'}`);
       output(`Resource references: ${result.resources.referencesOk ? 'ok' : 'missing references'}`);
+      output(
+        `Campaign statuses: ${result.campaignStatuses.errors.length > 0 ? 'check failed' : result.campaignStatuses.missing.length === 0 && result.campaignStatuses.unexpected.length === 0 ? 'ok' : 'needs attention'}`
+      );
       const missingLabels = result.campaignLabels.missing.length;
       output(
         `Campaign labels: ${result.campaignLabels.errors.length > 0 ? 'check failed' : missingLabels === 0 ? 'ok' : `${missingLabels} missing`}`
@@ -258,6 +290,52 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
         return;
       }
       printSync(output, result);
+    });
+
+  const campaign = program.command('campaign').description('Campaign Map setup and status commands.');
+  campaign
+    .command('labels')
+    .description('Check or apply Campaign Map workflow labels across mapped repos.')
+    .option('--apply', 'Create missing labels. Requires --confirm.')
+    .option('--confirm', 'Confirm label creation when used with --apply.')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { apply?: boolean; confirm?: boolean; json?: boolean }) => {
+      const result = runCampaignLabels(workspaceRoot, opts);
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printCampaignLabels(output, result);
+    });
+
+  campaign
+    .command('status-check')
+    .description('Validate Campaign Map Status options.')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { json?: boolean }) => {
+      const result = runCampaignStatusCheck();
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printCampaignStatusCheck(output, result);
+    });
+
+  campaign
+    .command('status')
+    .description('Set or preview an issue Campaign Map status.')
+    .requiredOption('--issue <owner/repo#number>', 'Issue to update.')
+    .requiredOption('--status <status>', `One of: ${CAMPAIGN_STATUSES.map((status) => status.name).join(', ')}`)
+    .option('--reason <text>', 'Human-readable reason, required for blockaded.')
+    .option('--confirm', 'Actually update the Campaign Map item.')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { issue: string; status: CampaignStatusName; reason?: string; confirm?: boolean; json?: boolean }) => {
+      const result = runCampaignStatus(opts);
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printCampaignStatus(output, result);
     });
 
   const issue = program.command('issue').description('Issue workflow commands.');

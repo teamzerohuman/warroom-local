@@ -41,7 +41,7 @@ If instructions conflict:
 
 ## GitHub Project
 
-TeamFloPay Project 1 is the Campaign Map. For now its statuses are `Todo`, `In Progress`, `Blocked`, and `Done`.
+TeamFloPay Project 1 is the Campaign Map. Its Status options are `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`.
 
 When updating issues or project state:
 

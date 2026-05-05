@@ -4,7 +4,7 @@ import { getRepoHealth, loadRepoManifest } from '../lib/repos.js';
 import { getEnvStatus } from '../lib/env.js';
 import { loadResourcesManifest, validateResourceReferences } from '../lib/resources.js';
 import { checkGithubAuth, checkTool } from '../lib/tools.js';
-import { checkCampaignLabels } from '../lib/campaign.js';
+import { checkCampaignLabels, checkCampaignStatusOptions } from '../lib/campaign.js';
 
 const requiredFiles = [
   'AGENTS.md',
@@ -35,6 +35,7 @@ export function runDoctor(workspaceRoot: string) {
     checkTool('npm', 'npm', ['--version']),
   ];
   const campaignLabels = checkCampaignLabels(manifest);
+  const campaignStatuses = checkCampaignStatusOptions();
 
   const structuralOk =
     files.every((file) => file.exists) &&
@@ -53,6 +54,7 @@ export function runDoctor(workspaceRoot: string) {
       missingReferences: resourceReferences.missing,
     },
     campaignLabels,
+    campaignStatuses,
     repos,
     repoCount: manifest.repos.length,
     activeRepoCount: manifest.repos.filter((repo) => repo.status === 'active').length,

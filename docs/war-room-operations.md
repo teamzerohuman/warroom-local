@@ -22,9 +22,9 @@ Use `--launch` only when ready to hand the scoped prompt to the configured LLM a
 
 ## Campaign Map
 
-TeamFloPay Project 1 is the Campaign Map. Current project statuses are `Todo`, `In Progress`, `Blocked`, and `Done`.
+TeamFloPay Project 1 is the Campaign Map. Current project statuses are `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`.
 
-Issue/PR commands use labels for local querying today. Project-field mutation is handled deliberately through GitHub CLI operations until the Campaign Map adapter is expanded.
+Use `warroom campaign status-check` to validate board status options, `warroom campaign labels` to inspect matching repo labels, and `warroom campaign status --issue owner/repo#number --status <status> --confirm` to move an issue deliberately.
 
 ## Recovery
 

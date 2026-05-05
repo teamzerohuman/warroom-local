@@ -49,6 +49,8 @@ npm run warroom -- --help
 npm run warroom -- doctor
 npm run warroom -- bootstrap --dry-run
 npm run warroom -- sync --report
+npm run warroom -- campaign status-check
+npm run warroom -- campaign labels
 npm run warroom -- maps study
 npm run warroom -- maps assign --check
 npm run warroom -- issue triage

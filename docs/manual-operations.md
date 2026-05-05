@@ -33,6 +33,16 @@ gh issue list --repo TeamFloPay/infra --state open --label needs-triage
 
 Write the implementation plan back to the issue as a normal GitHub comment.
 
+## Campaign Map
+
+```sh
+gh project field-list 1 --owner TeamFloPay
+gh project item-list 1 --owner TeamFloPay --limit 100
+gh project item-edit --id <item-id> --project-id <project-id> --field-id <status-field-id> --single-select-option-id <option-id>
+```
+
+Use `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory` as the board states.
+
 ## PR Engagement
 
 ```sh

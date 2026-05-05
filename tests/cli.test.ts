@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { runAbort } from '../src/commands/abort.js';
 import { runBootstrap } from '../src/commands/bootstrap.js';
+import { runCampaignStatusCheck } from '../src/commands/campaign.js';
 import { runDoctor } from '../src/commands/doctor.js';
 import { runDevStatus } from '../src/commands/dev-link.js';
 import { runMapsAssign } from '../src/commands/maps-assign.js';
@@ -28,7 +29,21 @@ describe('phase-1 CLI', () => {
 
   it('passes the skeleton doctor check', () => {
     expect(runDoctor(workspaceRoot).ok).toBe(true);
-  });
+  }, 30000);
+
+  it('sees the Campaign Map status options', () => {
+    const result = runCampaignStatusCheck();
+
+    expect(result.missing).toEqual([]);
+    expect(result.options.map((option) => option.name)).toEqual([
+      'needs-triage',
+      'ready-to-engage',
+      'battlefield-active',
+      'skirmish',
+      'blockaded',
+      'victory',
+    ]);
+  }, 30000);
 
   it('validates campaign atlas generation state', () => {
     const result = runMapsAssign(workspaceRoot, { check: true });
