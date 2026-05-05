@@ -62,13 +62,17 @@ function printMapsAssign(output: Output, result: MapsAssignResult) {
 }
 
 function printIssueList(output: Output, result: IssueListResult) {
-  output(`Issues with label ${result.label}: ${result.issues.length}`);
+  const selector = result.source === 'campaign' ? `Campaign status ${result.status}` : `label ${result.label}`;
+  output(`Issues with ${selector}: ${result.issues.length}`);
   for (const issue of result.issues) output(`${issue.repo}#${issue.number} ${issue.title} ${issue.url}`);
 }
 
 function printIssueHandoff(output: Output, result: IssueHandoffResult) {
   output(`Adapter: ${result.adapterCommand}${result.launched ? ' (launched)' : ' (not launched)'}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
+  if (result.campaignStatus) {
+    output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
+  }
   output(result.prompt);
 }
 
@@ -76,6 +80,9 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   output(`PR ${result.action}: ${result.launched ? 'launched' : 'preflight only'}`);
   if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
+  if (result.campaignStatus) {
+    output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
+  }
   output(result.prompt);
 }
 
@@ -117,7 +124,7 @@ function printCampaignStatusCheck(output: Output, result: ReturnType<typeof runC
 
 function printCampaignStatus(output: Output, result: ReturnType<typeof runCampaignStatus>) {
   output(`Campaign status: ${result.applied ? 'updated' : 'planned'} ${result.issue} -> ${result.status}`);
-  output(`Project item: ${result.projectItemId}`);
+  output(`Project item: ${result.projectItemId ?? 'not added in preview'}`);
   output(`Option: ${result.optionId}`);
   if (result.reason) output(`Reason: ${result.reason}`);
 }
@@ -352,13 +359,17 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     .description('List triage issues or create a scoped LLM triage handoff for one issue.')
     .option('--issue <owner/repo#number>', 'Issue to triage.')
     .option('--label <label>', 'Label used for triage listing.', 'needs-triage')
+    .option('--mark-ready', 'Preview or move the issue to ready-to-engage after triage.')
+    .option('--confirm-status', 'Apply the Campaign Map status movement requested by --mark-ready.')
     .option('--launch', 'Launch the configured LLM adapter. Defaults to dry-run handoff output.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { issue?: string; label?: string; launch?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+    .action((opts: { issue?: string; label?: string; markReady?: boolean; confirmStatus?: boolean; launch?: boolean; writeArtifact?: boolean; json?: boolean }) => {
       const result = runIssueTriage(workspaceRoot, {
         issue: opts.issue,
         label: opts.label,
+        markReady: opts.markReady,
+        confirmStatus: opts.confirmStatus,
         dryRun: !opts.launch,
         writeArtifact: opts.writeArtifact,
       });
@@ -389,10 +400,16 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     .description('Create a scoped PR engagement preflight handoff from an issue.')
     .requiredOption('--issue <owner/repo#number>', 'Issue to implement.')
     .option('--launch', 'Launch the configured LLM adapter. Defaults to dry-run handoff output.')
+    .option('--confirm-status', 'Move the issue to battlefield-active on the Campaign Map.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { issue: string; launch?: boolean; writeArtifact?: boolean; json?: boolean }) => {
-      const result = runPrEngage(workspaceRoot, { issue: opts.issue, dryRun: !opts.launch, writeArtifact: opts.writeArtifact });
+    .action((opts: { issue: string; launch?: boolean; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+      const result = runPrEngage(workspaceRoot, {
+        issue: opts.issue,
+        dryRun: !opts.launch,
+        confirmStatus: opts.confirmStatus,
+        writeArtifact: opts.writeArtifact,
+      });
       if (opts.json) {
         printJson(output, result);
         return;
@@ -403,11 +420,19 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     .command('review')
     .description('Create a scoped PR review-loop handoff.')
     .requiredOption('--pr <owner/repo#number>', 'PR to review.')
+    .option('--issue <owner/repo#number>', 'Linked issue to move to skirmish.')
     .option('--launch', 'Launch the configured LLM adapter. Defaults to dry-run handoff output.')
+    .option('--confirm-status', 'Move the linked issue to skirmish on the Campaign Map.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { pr: string; launch?: boolean; writeArtifact?: boolean; json?: boolean }) => {
-      const result = runPrReview(workspaceRoot, { pr: opts.pr, dryRun: !opts.launch, writeArtifact: opts.writeArtifact });
+    .action((opts: { pr: string; issue?: string; launch?: boolean; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+      const result = runPrReview(workspaceRoot, {
+        pr: opts.pr,
+        issue: opts.issue,
+        dryRun: !opts.launch,
+        confirmStatus: opts.confirmStatus,
+        writeArtifact: opts.writeArtifact,
+      });
       if (opts.json) {
         printJson(output, result);
         return;
@@ -418,11 +443,19 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     .command('merge')
     .description('Preflight or confirm a GitHub PR merge.')
     .requiredOption('--pr <owner/repo#number>', 'PR to merge.')
+    .option('--issue <owner/repo#number>', 'Linked issue to move to victory.')
     .option('--confirm', 'Actually run gh pr merge --squash --delete-branch.')
+    .option('--confirm-status', 'Move the linked issue to victory on the Campaign Map.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { pr: string; confirm?: boolean; writeArtifact?: boolean; json?: boolean }) => {
-      const result = runPrMerge(workspaceRoot, { pr: opts.pr, confirm: opts.confirm, writeArtifact: opts.writeArtifact });
+    .action((opts: { pr: string; issue?: string; confirm?: boolean; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+      const result = runPrMerge(workspaceRoot, {
+        pr: opts.pr,
+        issue: opts.issue,
+        confirm: opts.confirm,
+        confirmStatus: opts.confirmStatus,
+        writeArtifact: opts.writeArtifact,
+      });
       if (opts.json) {
         printJson(output, result);
         return;

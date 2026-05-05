@@ -51,10 +51,20 @@ export type CampaignStatusReport = {
 export type CampaignStatusSetResult = {
   issue: string;
   status: CampaignStatusName;
-  projectItemId: string;
+  projectItemId: string | null;
   optionId: string;
   applied: boolean;
   reason: string | null;
+};
+
+export type CampaignProjectIssue = {
+  repo: string;
+  number: number;
+  title: string;
+  url: string;
+  status: string | null;
+  labels: string[];
+  projectItemId: string;
 };
 
 function ghJson<T>(args: string[], fallback: T): T {
@@ -204,9 +214,40 @@ function projectItemForIssue(issue: string) {
   return items.items?.find((item) => item.content?.repository === ref.repo && item.content?.number === ref.number) ?? null;
 }
 
-function ensureProjectItem(issue: string) {
+export function listCampaignIssuesByStatus(status: CampaignStatusName): CampaignProjectIssue[] {
+  const items = ghJson<{
+    items?: Array<{
+      id: string;
+      title?: string;
+      status?: string;
+      labels?: string[];
+      content?: {
+        repository?: string;
+        number?: number;
+        title?: string;
+        url?: string;
+      };
+    }>;
+  }>(['project', 'item-list', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json', '--limit', '100'], {});
+
+  return (items.items ?? [])
+    .filter((item) => item.status === status && item.content?.repository && item.content?.number)
+    .map((item) => ({
+      repo: item.content?.repository ?? '',
+      number: item.content?.number ?? 0,
+      title: item.content?.title ?? item.title ?? '',
+      url: item.content?.url ?? `https://github.com/${item.content?.repository}/issues/${item.content?.number}`,
+      status: item.status ?? null,
+      labels: item.labels ?? [],
+      projectItemId: item.id,
+    }));
+}
+
+function ensureProjectItem(issue: string, confirm: boolean) {
   const existing = projectItemForIssue(issue);
   if (existing) return existing;
+
+  if (!confirm) return null;
 
   const ref = parseIssueRef(issue);
   const url = `https://github.com/${ref.repo}/issues/${ref.number}`;
@@ -233,9 +274,10 @@ export function setCampaignStatus(issue: string, status: CampaignStatusName, opt
 
   const option = report.options.find((entry) => entry.name === status);
   if (!option) throw new Error(`Campaign Map status option missing: ${status}`);
-  const item = ensureProjectItem(issue);
+  const item = ensureProjectItem(issue, options.confirm ?? false);
 
   if (options.confirm) {
+    if (!item) throw new Error(`Could not find or add ${issue} on Campaign Map.`);
     const result = spawnSync(
       'gh',
       [
@@ -258,7 +300,7 @@ export function setCampaignStatus(issue: string, status: CampaignStatusName, opt
   return {
     issue,
     status,
-    projectItemId: item.id,
+    projectItemId: item?.id ?? null,
     optionId: option.id,
     applied: options.confirm ?? false,
     reason: options.reason ?? null,

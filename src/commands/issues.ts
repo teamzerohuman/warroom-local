@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
+import { listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getAdapterCommand } from '../lib/env.js';
 import { loadRepoManifest } from '../lib/repos.js';
 
@@ -12,10 +13,14 @@ export type IssueSummary = IssueRef & {
   title: string;
   url: string;
   labels: string[];
+  status?: string | null;
+  projectItemId?: string;
 };
 
 export type IssueListResult = {
-  label: string;
+  label?: string;
+  status?: string;
+  source: 'campaign' | 'labels';
   issues: IssueSummary[];
 };
 
@@ -24,11 +29,14 @@ export type IssueHandoffResult = {
   artifact: RunArtifact | null;
   launched: boolean;
   adapterCommand: string;
+  campaignStatus: CampaignStatusSetResult | null;
 };
 
 export type IssueTriageOptions = {
   issue?: string;
   label?: string;
+  markReady?: boolean;
+  confirmStatus?: boolean;
   dryRun?: boolean;
   writeArtifact?: boolean;
 };
@@ -75,7 +83,7 @@ export function listIssuesByLabel(workspaceRoot: string, label: string): IssueLi
     }
   }
 
-  return { label, issues };
+  return { label, source: 'labels', issues };
 }
 
 function issueContext(ref: IssueRef) {
@@ -106,6 +114,17 @@ function buildTriagePrompt(ref: IssueRef) {
 }
 
 export function runIssueNext(workspaceRoot: string, label = 'ready-to-engage') {
+  const issues = listCampaignIssuesByStatus('ready-to-engage').map((issue) => ({
+    repo: issue.repo,
+    number: issue.number,
+    title: issue.title,
+    url: issue.url,
+    labels: issue.labels,
+    status: issue.status,
+    projectItemId: issue.projectItemId,
+  }));
+
+  if (issues.length > 0) return { status: 'ready-to-engage', source: 'campaign' as const, issues };
   return listIssuesByLabel(workspaceRoot, label);
 }
 
@@ -122,11 +141,14 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
       })
     : null;
   const adapterCommand = getAdapterCommand(workspaceRoot);
+  const campaignStatus = options.markReady
+    ? setCampaignStatus(options.issue, 'ready-to-engage', { confirm: options.confirmStatus })
+    : null;
 
   if (options.dryRun !== false) {
-    return { prompt, artifact, launched: false, adapterCommand };
+    return { prompt, artifact, launched: false, adapterCommand, campaignStatus };
   }
 
   const launched = spawnSync(adapterCommand, [], { input: prompt, stdio: ['pipe', 'inherit', 'inherit'] }).status === 0;
-  return { prompt, artifact, launched, adapterCommand };
+  return { prompt, artifact, launched, adapterCommand, campaignStatus };
 }

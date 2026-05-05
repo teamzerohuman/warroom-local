@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
+import { setCampaignStatus, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getAdapterCommand } from '../lib/env.js';
 import { parseIssueRef } from './issues.js';
 
@@ -10,6 +11,7 @@ export type PrOptions = {
   writeArtifact?: boolean;
   confirm?: boolean;
   base?: string;
+  confirmStatus?: boolean;
 };
 
 export type PrPlanResult = {
@@ -18,6 +20,7 @@ export type PrPlanResult = {
   launched: boolean;
   adapterCommand: string | null;
   action: 'engage' | 'review' | 'merge';
+  campaignStatus: CampaignStatusSetResult | null;
 };
 
 function ghJson<T>(args: string[], fallback: T): T {
@@ -68,10 +71,11 @@ export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanRe
       })
     : null;
   const adapterCommand = getAdapterCommand(workspaceRoot);
+  const campaignStatus = setCampaignStatus(options.issue, 'battlefield-active', { confirm: options.confirmStatus });
 
-  if (options.dryRun !== false) return { prompt, artifact, launched: false, adapterCommand, action: 'engage' };
+  if (options.dryRun !== false) return { prompt, artifact, launched: false, adapterCommand, action: 'engage', campaignStatus };
   const launched = spawnSync(adapterCommand, [], { input: prompt, stdio: ['pipe', 'inherit', 'inherit'] }).status === 0;
-  return { prompt, artifact, launched, adapterCommand, action: 'engage' };
+  return { prompt, artifact, launched, adapterCommand, action: 'engage', campaignStatus };
 }
 
 export function runPrReview(workspaceRoot: string, options: PrOptions): PrPlanResult {
@@ -105,10 +109,13 @@ export function runPrReview(workspaceRoot: string, options: PrOptions): PrPlanRe
       })
     : null;
   const adapterCommand = getAdapterCommand(workspaceRoot);
+  const campaignStatus = options.issue
+    ? setCampaignStatus(options.issue, 'skirmish', { confirm: options.confirmStatus })
+    : null;
 
-  if (options.dryRun !== false) return { prompt, artifact, launched: false, adapterCommand, action: 'review' };
+  if (options.dryRun !== false) return { prompt, artifact, launched: false, adapterCommand, action: 'review', campaignStatus };
   const launched = spawnSync(adapterCommand, [], { input: prompt, stdio: ['pipe', 'inherit', 'inherit'] }).status === 0;
-  return { prompt, artifact, launched, adapterCommand, action: 'review' };
+  return { prompt, artifact, launched, adapterCommand, action: 'review', campaignStatus };
 }
 
 export function runPrMerge(workspaceRoot: string, options: PrOptions): PrPlanResult {
@@ -148,5 +155,9 @@ export function runPrMerge(workspaceRoot: string, options: PrOptions): PrPlanRes
     if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);
   }
 
-  return { prompt, artifact, launched: false, adapterCommand: null, action: 'merge' };
+  const campaignStatus = options.issue
+    ? setCampaignStatus(options.issue, 'victory', { confirm: options.confirmStatus })
+    : null;
+
+  return { prompt, artifact, launched: false, adapterCommand: null, action: 'merge', campaignStatus };
 }

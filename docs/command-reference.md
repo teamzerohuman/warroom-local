@@ -15,13 +15,13 @@ warroom campaign status --issue TeamFloPay/infra#4 --status battlefield-active
 warroom maps study
 warroom maps assign --check
 warroom issue triage
-warroom issue triage --issue TeamFloPay/infra#4 --write-artifact
+warroom issue triage --issue TeamFloPay/infra#4 --mark-ready --write-artifact
 warroom issue next
 warroom issue create
 warroom issue fortify
 warroom pr engage --issue TeamFloPay/infra#4
-warroom pr review --pr TeamFloPay/warroom#1
-warroom pr merge --pr TeamFloPay/warroom#1
+warroom pr review --pr TeamFloPay/warroom#1 --issue TeamFloPay/infra#4
+warroom pr merge --pr TeamFloPay/warroom#1 --issue TeamFloPay/infra#4
 warroom commit create --repo sdk
 warroom abort --print-recovery
 warroom dev status
@@ -43,6 +43,7 @@ warroom pr review --help
 - `campaign labels --apply` creates missing repo labels only when `--confirm` is also present.
 - `campaign status` previews issue status movement unless `--confirm` is present. Moving to `blockaded` requires `--reason`.
 - Issue and PR handoff commands print scoped prompts by default. Add `--launch` to start the configured LLM adapter.
+- Workflow status movement is guarded separately with `--confirm-status`.
 - `pr merge` only merges when `--confirm` is present.
 - `commit create` only commits when `--confirm` is present. `--all` is also explicit.
 - `abort` never resets, cleans, checks out, or deletes branches. `--stash` requires `--confirm`.
@@ -59,13 +60,13 @@ warroom pr review --help
 
 `warroom maps assign` validates or updates Sergeant/resource assignments. Use `--repo`, `--sergeant`, `--add-resource`, and `--remove-resource` for targeted edits. Pass `--write` to update `repos.yaml` and regenerate `maps/campaign-atlas.md`; protected notes blocks are preserved.
 
-`warroom issue triage` lists open issues with the `needs-triage` label by default. With `--issue owner/repo#number`, it builds a scoped handoff prompt and can write `.warroom/runs/*` artifacts.
+`warroom issue triage` lists open issues with the `needs-triage` label by default. With `--issue owner/repo#number`, it builds a scoped handoff prompt and can write `.warroom/runs/*` artifacts. Add `--mark-ready --confirm-status` after a successful triage to move the issue to `ready-to-engage`.
 
-`warroom issue next` lists open issues with the `ready-to-engage` label by default.
+`warroom issue next` lists Campaign Map items in `ready-to-engage`. If the project query returns no items, it falls back to open issues with the `ready-to-engage` label.
 
 `warroom issue create` and `warroom issue fortify` are explicit post-MVP placeholders tracked by TeamFloPay/infra#7.
 
-`warroom pr engage`, `warroom pr review`, and `warroom pr merge` provide preflight plans and scoped handoffs. Full code-writing automation remains human-directed through the launched adapter.
+`warroom pr engage`, `warroom pr review`, and `warroom pr merge` provide preflight plans and scoped handoffs. `pr engage --confirm-status` moves the issue to `battlefield-active`; `pr review --issue ... --confirm-status` moves it to `skirmish`; `pr merge --issue ... --confirm-status` moves it to `victory`. Full code-writing automation remains human-directed through the launched adapter.
 
 `warroom commit create` inspects a mapped child repo, proposes a conventional commit message, and refuses to proceed when other child repos are dirty.
 
