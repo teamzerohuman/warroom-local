@@ -10,6 +10,15 @@ npm run build
 npm test
 ```
 
+To make War Room available as a system-wide local CLI:
+
+```sh
+npm run link:global
+warroom doctor
+```
+
+The linked `warroom` command discovers the workspace from the current directory. It can be run from the War Room repo, from nested `maps/repos/*` checkouts, or from sibling child repos such as `../sdk`, `../backend`, and `../demo`. For non-sibling checkouts, set `WARROOM_ROOT=/path/to/warroom`.
+
 ## Child Repos
 
 Child repositories should be checked out under `maps/repos/*` by future bootstrap/sync commands. That directory is ignored because child repos commit their work independently.

@@ -1,14 +1,17 @@
 import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
-import { getRepoById, getRepoHealth, loadRepoManifest } from '../lib/repos.js';
+import { getRepoById, getRepoHealth, loadRepoManifest, type RepoHealth } from '../lib/repos.js';
 
 export type CommitCreateOptions = {
   repo?: string;
   message?: string;
   confirm?: boolean;
   all?: boolean;
+  push?: boolean;
   validate?: string[];
   writeArtifact?: boolean;
+  currentPath?: string;
 };
 
 export type CommitFileChange = {
@@ -41,8 +44,18 @@ export type CommitCreateResult = {
   suggestedMessage: string;
   committed: boolean;
   committedSha: string | null;
+  pushed: boolean;
+  pushCommand: string | null;
+  pushSkippedReason: string | null;
   blocked: string[];
   artifact?: RunArtifact;
+};
+
+type PushPlan = {
+  args: string[] | null;
+  command: string | null;
+  blocker: string | null;
+  skippedReason: string | null;
 };
 
 function parseStatusLine(line: string): CommitFileChange {
@@ -101,6 +114,81 @@ function suggestMessage(repoId: string, changes: CommitFileChange[]) {
   return `${prefix}(${repoId}): update war room workflow`;
 }
 
+function containsPath(parent: string, child: string) {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function inferRepoFromPath(repos: RepoHealth[], currentPath: string) {
+  const resolved = path.resolve(currentPath);
+  return repos
+    .filter((repo) => repo.checkedOut && containsPath(repo.resolvedPath, resolved))
+    .sort((left, right) => right.resolvedPath.length - left.resolvedPath.length)[0]?.id;
+}
+
+function shellQuote(value: string) {
+  return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function hasOriginRemote(repoPath: string) {
+  const result = spawnSync('git', ['remote', 'get-url', 'origin'], { cwd: repoPath, encoding: 'utf8' });
+  return result.status === 0 && result.stdout.trim().length > 0;
+}
+
+function buildPushPlan(repo: RepoHealth, shouldPush: boolean): PushPlan {
+  if (!shouldPush) {
+    return {
+      args: null,
+      command: null,
+      blocker: null,
+      skippedReason: 'Push disabled by --no-push.',
+    };
+  }
+
+  if (!repo.checkedOut) {
+    return {
+      args: null,
+      command: null,
+      blocker: 'Repo checkout is missing; cannot push.',
+      skippedReason: null,
+    };
+  }
+
+  if (repo.upstream) {
+    return {
+      args: ['push'],
+      command: 'git push',
+      blocker: null,
+      skippedReason: null,
+    };
+  }
+
+  if (!repo.branch) {
+    return {
+      args: null,
+      command: null,
+      blocker: 'Repo current branch is unknown; cannot push.',
+      skippedReason: null,
+    };
+  }
+
+  if (!hasOriginRemote(repo.resolvedPath)) {
+    return {
+      args: null,
+      command: null,
+      blocker: 'Repo has no upstream and no origin remote for push.',
+      skippedReason: null,
+    };
+  }
+
+  return {
+    args: ['push', '-u', 'origin', 'HEAD'],
+    command: 'git push -u origin HEAD',
+    blocker: null,
+    skippedReason: null,
+  };
+}
+
 function markdownSummary(result: Omit<CommitCreateResult, 'artifact'>) {
   const lines = [
     `# Commit Create: ${result.repo}`,
@@ -111,6 +199,7 @@ function markdownSummary(result: Omit<CommitCreateResult, 'artifact'>) {
     `- Upstream: ${result.upstream ?? 'none'}`,
     `- Suggested message: ${result.suggestedMessage}`,
     `- Committed: ${result.committed ? 'yes' : 'no'}`,
+    `- Push: ${result.pushSkippedReason ? `skipped (${result.pushSkippedReason})` : result.pushCommand ? `${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}` : 'none'}`,
   ];
 
   if (result.committedSha) lines.push(`- Commit SHA: ${result.committedSha}`);
@@ -145,12 +234,13 @@ function markdownSummary(result: Omit<CommitCreateResult, 'artifact'>) {
 }
 
 export function runCommitCreate(workspaceRoot: string, options: CommitCreateOptions = {}): CommitCreateResult {
-  if (!options.repo) throw new Error('warroom commit create requires --repo <id>.');
   const manifest = loadRepoManifest(workspaceRoot);
-  const repoEntry = getRepoById(workspaceRoot, options.repo);
+  const repoHealth = manifest.repos.map((entry) => getRepoHealth(workspaceRoot, entry));
+  const repoId = options.repo ?? inferRepoFromPath(repoHealth, options.currentPath ?? process.cwd());
+  if (!repoId) throw new Error('warroom commit create requires --repo <id> unless run inside a mapped child repo.');
+  const repoEntry = getRepoById(workspaceRoot, repoId);
   const repo = getRepoHealth(workspaceRoot, repoEntry);
-  const dirtyRepos = manifest.repos
-    .map((entry) => getRepoHealth(workspaceRoot, entry))
+  const dirtyRepos = repoHealth
     .filter((entry) => entry.id !== repo.id && entry.clean === false);
   const blocked: string[] = [];
 
@@ -163,12 +253,16 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
   const changes = repo.clean === false ? repo.statusLines.map(parseStatusLine) : [];
   const stagedChanges = changes.filter((change) => change.staged);
   const unstagedChanges = changes.filter((change) => change.unstaged);
+  const pushPlan = buildPushPlan(repo, options.push !== false);
 
   if (options.confirm && !options.all && stagedChanges.length === 0) {
     blocked.push('No staged changes are ready to commit. Stage files first or pass --all.');
   }
   if (options.confirm && !options.all && unstagedChanges.length > 0) {
     blocked.push('Unstaged changes are present. Commit staged changes manually or pass --all.');
+  }
+  if (pushPlan.blocker) {
+    blocked.push(pushPlan.blocker);
   }
 
   const validation = blocked.length === 0 ? (options.validate ?? []).map((command) => runValidation(repo.resolvedPath, command)) : [];
@@ -179,6 +273,7 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
   const suggestedMessage = options.message ?? suggestMessage(repo.id, changes);
   let committed = false;
   let committedSha: string | null = null;
+  let pushed = false;
 
   if (options.confirm) {
     if (blocked.length > 0) throw new Error(blocked.join(' '));
@@ -191,6 +286,14 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
     committed = true;
     const sha = spawnSync('git', ['rev-parse', '--short', 'HEAD'], { cwd: repo.resolvedPath, encoding: 'utf8' });
     committedSha = sha.status === 0 ? sha.stdout.trim() : null;
+
+    if (pushPlan.args) {
+      const push = spawnSync('git', pushPlan.args, { cwd: repo.resolvedPath, stdio: 'inherit' });
+      if (push.status !== 0) {
+        throw new Error(`${pushPlan.command ?? `git ${pushPlan.args.map(shellQuote).join(' ')}`} failed with exit ${push.status ?? 'unknown'}.`);
+      }
+      pushed = true;
+    }
   }
 
   const result: Omit<CommitCreateResult, 'artifact'> = {
@@ -206,6 +309,9 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
     suggestedMessage,
     committed,
     committedSha,
+    pushed,
+    pushCommand: pushPlan.command,
+    pushSkippedReason: pushPlan.skippedReason,
     blocked,
   };
 
@@ -216,10 +322,11 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
     artifact: createRunArtifact(workspaceRoot, 'commit-create', {
       'input.json': JSON.stringify(
         {
-          repo: options.repo,
+          repo: repoId,
           message: options.message ?? null,
           confirm: options.confirm ?? false,
           all: options.all ?? false,
+          push: options.push ?? true,
           validate: options.validate ?? [],
           writeArtifact: true,
         },

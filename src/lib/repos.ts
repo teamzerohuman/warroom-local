@@ -21,6 +21,7 @@ const RepoSchema = z.object({
   local_path: z.string(),
   status: z.enum(['active', 'planned']),
   planned_by: z.string().optional(),
+  merge_playwright: z.boolean().default(false),
   owner: z.string(),
   description: z.string(),
   specialist: SpecialistSchema,

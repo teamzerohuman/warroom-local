@@ -2,6 +2,7 @@
 import { Command } from 'commander';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { runAbort, type AbortResult } from './commands/abort.js';
 import { runAlliesStatus, type AlliesStatus } from './commands/allies.js';
@@ -25,12 +26,24 @@ import {
 } from './commands/issues.js';
 import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js';
 import { runMapsStudy } from './commands/maps-study.js';
-import { runPrEngage, runPrMerge, runPrReview, type PrPlanResult } from './commands/pr.js';
+import {
+  inferPrRefForCurrentBranch,
+  runPrEngage,
+  runPrMerge,
+  runPrReview,
+  runPrReviewQueue,
+  type LocalCleanupResult,
+  type PrPlanResult,
+  type PrReviewQueueResult,
+  type SummaryPostResult,
+} from './commands/pr.js';
 import { runSync, type SyncResult } from './commands/sync.js';
 import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
+import { findWarRoomWorkspace } from './lib/workspace.js';
 
 type Output = (text: string) => void;
 type Input = NodeJS.ReadableStream & { isTTY?: boolean };
+type E2EOutput = (chunk: string, stream: 'stdout' | 'stderr') => void;
 type BuildProgramOptions = {
   cwd?: string;
   output?: Output;
@@ -132,6 +145,37 @@ async function promptIssueSelection(output: Output, input: Input, issues: IssueS
   return null;
 }
 
+async function promptConfirmation(output: Output, input: Input, question: string) {
+  output(question);
+
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of readline) {
+      const answer = line.trim().toLowerCase();
+      return answer === 'y' || answer === 'yes';
+    }
+  } finally {
+    readline.close();
+  }
+
+  return false;
+}
+
+function createE2EOutput(output: Output, customOutput: boolean): E2EOutput {
+  if (!customOutput) {
+    return (chunk, stream) => {
+      const target = stream === 'stderr' ? process.stderr : process.stdout;
+      target.write(chunk);
+    };
+  }
+
+  return (chunk) => {
+    const normalized = chunk.replace(/\r/g, '\n').trimEnd();
+    if (!normalized) return;
+    for (const line of normalized.split('\n')) output(line);
+  };
+}
+
 function printIssueHandoff(output: Output, result: IssueHandoffResult) {
   output(`Adapter: ${result.adapterCommand}${result.launched ? ' (launched)' : ' (not launched)'}`);
   if (result.launchError) output(`Adapter error: ${result.launchError}`);
@@ -168,22 +212,103 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   if (result.mergeReadiness) {
     output(`Merge readiness: ${result.mergeReadiness.blocked.length === 0 ? 'clear' : 'blocked'}`);
     for (const blocker of result.mergeReadiness.blocked) output(`blocked: ${blocker}`);
+    for (const detail of result.mergeReadiness.details) {
+      output(`why blocked: ${detail.explanation}`);
+      for (const evidence of detail.evidence) output(`evidence: ${evidence}`);
+      output(`resolve: ${detail.resolution}`);
+    }
+    if (result.mergeReadiness.requestedReviewers.length > 0) {
+      output(`Requested reviewers: ${result.mergeReadiness.requestedReviewers.join(', ')}`);
+    }
+    for (const thread of result.mergeReadiness.unresolvedReviewThreads) {
+      const line = thread.line === null ? '' : `:${thread.line}`;
+      const state = thread.isOutdated ? 'outdated unresolved' : 'unresolved';
+      output(`review thread: ${thread.path}${line} by @${thread.author} (${state})${thread.url ? ` ${thread.url}` : ''}`);
+    }
+  }
+  if (result.mergeE2E) {
+    output(`Merge e2e: ${result.mergeE2E.status}${result.mergeE2E.skipReason ? ` (${result.mergeE2E.skipReason})` : ''}`);
+    if (result.mergeE2E.required) {
+      output(`Backend: ${result.mergeE2E.backendPath ?? 'missing'} (${result.mergeE2E.backendCommand}, ready ${result.mergeE2E.backendReadyUrl})`);
+      output(`Backend process: ${result.mergeE2E.usedExistingBackend ? 'reused existing' : result.mergeE2E.startedBackend ? 'started by War Room' : 'planned'}`);
+      output(`Demo: ${result.mergeE2E.demoPath ?? 'missing'} (${result.mergeE2E.demoCommand}, base ${result.mergeE2E.demoBaseUrl})`);
+    }
+    if (result.mergeE2E.durationMs !== null) output(`Merge e2e duration: ${result.mergeE2E.durationMs}ms`);
+    if (result.mergeE2E.testExitStatus !== null) output(`Merge e2e exit: ${result.mergeE2E.testExitStatus}`);
+    for (const blocker of result.mergeE2E.blocked) output(`e2e blocked: ${blocker}`);
+    if (result.mergeE2E.error) output(`e2e error: ${result.mergeE2E.error}`);
   }
   if (result.merged !== undefined) output(`Merged: ${result.merged ? 'yes' : 'no'}`);
-  for (const post of result.summaryPosts ?? []) {
-    const state = post.applied ? 'posted' : post.error ? 'failed' : 'planned';
-    output(`Summary ${post.target}: ${state} ${post.ref}${post.url ? ` ${post.url}` : ''}${post.reason ? ` (${post.reason})` : ''}`);
-    if (post.error) output(`summary error: ${post.error}`);
-  }
-  if (result.localCleanup) {
-    output(`Local cleanup: ${result.localCleanup.applied ? 'applied' : result.localCleanup.blocked.length ? 'blocked' : 'planned'} ${result.localCleanup.repo}`);
-    for (const blocker of result.localCleanup.blocked) output(`cleanup blocked: ${blocker}`);
-    for (const message of result.localCleanup.messages) output(`cleanup: ${message}`);
-  }
+  printSummaryPosts(output, result.summaryPosts);
+  printLocalCleanup(output, result.localCleanup);
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
   output(result.prompt);
+}
+
+function printSummaryPosts(output: Output, posts: SummaryPostResult[] | undefined) {
+  for (const post of posts ?? []) {
+    const state = post.applied ? 'posted' : post.error ? 'failed' : 'planned';
+    output(`Summary ${post.target}: ${state} ${post.ref}${post.url ? ` ${post.url}` : ''}${post.reason ? ` (${post.reason})` : ''}`);
+    if (post.error) output(`summary error: ${post.error}`);
+  }
+}
+
+function printLocalCleanup(output: Output, cleanup: LocalCleanupResult | null | undefined) {
+  if (!cleanup) return;
+  output(`Local cleanup: ${cleanup.applied ? 'applied' : cleanup.blocked.length ? 'blocked' : 'planned'} ${cleanup.repo}`);
+  for (const blocker of cleanup.blocked) output(`cleanup blocked: ${blocker}`);
+  for (const message of cleanup.messages) output(`cleanup: ${message}`);
+}
+
+async function promptPrMergeFollowUps(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  options: {
+    pr: string;
+    issue?: string;
+    summary?: string;
+    confirmSummary?: boolean;
+    confirmCleanup?: boolean;
+  }
+) {
+  if (!options.confirmSummary) {
+    const postSummary = await promptConfirmation(output, input, 'Post victory summary comments now? [y/N]');
+    if (postSummary) {
+      const summaryResult = await runPrMerge(workspaceRoot, {
+        pr: options.pr,
+        issue: options.issue,
+        summary: options.summary,
+        postSummary: true,
+        confirmSummary: true,
+      });
+      printSummaryPosts(output, summaryResult.summaryPosts);
+    }
+  }
+
+  if (!options.confirmCleanup) {
+    const cleanup = await promptConfirmation(output, input, 'Return the local checkout to the PR base branch now? [y/N]');
+    if (cleanup) {
+      const cleanupResult = await runPrMerge(workspaceRoot, {
+        pr: options.pr,
+        cleanupLocal: true,
+        confirmCleanup: true,
+      });
+      printLocalCleanup(output, cleanupResult.localCleanup);
+    }
+  }
+}
+
+function printPrReviewQueue(output: Output, result: PrReviewQueueResult) {
+  output(`Open PRs for Campaign statuses ${result.statuses.join(', ')}: ${result.prs.length}`);
+  for (const pr of result.prs) {
+    const issues = pr.issues
+      .map((issue) => `${issue.repo}#${issue.number}${issue.status ? ` ${issue.status}` : ''}`)
+      .join(', ');
+    output(`${pr.repo}#${pr.number} ${pr.title} (updated ${pr.updatedAt ?? 'unknown'}; issue ${issues}) ${pr.url}`);
+  }
 }
 
 function printCommitCreate(output: Output, result: CommitCreateResult) {
@@ -191,6 +316,8 @@ function printCommitCreate(output: Output, result: CommitCreateResult) {
   output(`Path: ${result.path}`);
   output(`Branch: ${result.branch ?? 'unknown'}@${result.headSha ?? 'unknown'}`);
   output(`Suggested message: ${result.suggestedMessage}`);
+  if (result.pushSkippedReason) output(`Push: skipped (${result.pushSkippedReason})`);
+  else if (result.pushCommand) output(`Push: ${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
   for (const change of result.changes) {
     const state = change.staged && change.unstaged ? 'staged+unstaged' : change.staged ? 'staged' : 'unstaged';
@@ -291,8 +418,10 @@ function printDevAction(output: Output, action: DevActionResult) {
 }
 
 export function buildProgram(options: BuildProgramOptions = {}) {
-  const workspaceRoot = options.cwd ?? process.cwd();
+  const invocationCwd = options.cwd ?? process.cwd();
+  const workspaceRoot = findWarRoomWorkspace(invocationCwd);
   const output = options.output ?? console.log;
+  const customOutput = options.output !== undefined;
   const input = options.input ?? process.stdin;
   const interactive = options.interactive ?? Boolean(input.isTTY);
   const program = new Command();
@@ -607,7 +736,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
   const pr = program.command('pr').description('Pull request workflow commands.');
   pr
     .command('engage')
-    .description('Create a scoped implementation handoff from an issue.')
+    .description('Creates a PR from an issue.')
     .requiredOption('--issue <owner/repo#number>', 'Issue to implement.')
     .option('--base <branch>', 'Target branch for the eventual PR.', 'main')
     .option('--dry-run', 'Print the structured handoff without launching the configured LLM adapter.')
@@ -634,8 +763,8 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     });
   pr
     .command('review')
-    .description('Create a scoped PR review-loop handoff.')
-    .requiredOption('--pr <owner/repo#number>', 'PR to review.')
+    .description('Create a PR review-loop (skirmish) handoff.')
+    .option('--pr <owner/repo#number>', 'PR to review. Omit to list open review PRs from active Campaign Map issues.')
     .option('--issue <owner/repo#number>', 'Linked issue to move to skirmish.')
     .option('--dry-run', 'Print the structured handoff and context summary without launching the configured LLM adapter.')
     .option('--launch', 'Launch the configured LLM adapter. Defaults to dry-run handoff output.')
@@ -643,7 +772,17 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--confirm-status', 'Move the linked issue to skirmish on the Campaign Map.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { pr: string; issue?: string; dryRun?: boolean; launch?: boolean; checkInMinutes?: number; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+    .action((opts: { pr?: string; issue?: string; dryRun?: boolean; launch?: boolean; checkInMinutes?: number; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+      if (!opts.pr) {
+        const result = runPrReviewQueue();
+        if (opts.json) {
+          printJson(output, result);
+          return;
+        }
+        printPrReviewQueue(output, result);
+        return;
+      }
+
       const result = runPrReview(workspaceRoot, {
         pr: opts.pr,
         issue: opts.issue,
@@ -660,20 +799,20 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     });
   pr
     .command('merge')
-    .description('Preflight or confirm a GitHub PR merge.')
-    .requiredOption('--pr <owner/repo#number>', 'PR to merge.')
+    .description('Preflight or confirm a GitHub PR merge gated by the demo Playwright e2e run.')
+    .option('--pr <owner/repo#number>', 'PR to merge. Omit to infer from the current mapped repo branch.')
     .option('--issue <owner/repo#number>', 'Linked issue to move to victory.')
-    .option('--confirm', 'Actually run gh pr merge --squash --delete-branch.')
+    .option('--confirm', 'Run the demo e2e gate, then gh pr merge --squash --delete-branch.')
     .option('--confirm-status', 'Move the linked issue to victory on the Campaign Map.')
     .option('--summary <text>', 'Victory summary to include in local artifacts and optional comments.')
     .option('--post-summary', 'Plan or post victory summary comments to the PR and linked issue.')
-    .option('--confirm-summary', 'Actually post victory summary comments. Requires --post-summary.')
+    .option('--confirm-summary', 'Actually post victory summary comments. Implies --post-summary.')
     .option('--cleanup-local', 'Plan or return the mapped local checkout to the PR base branch.')
-    .option('--confirm-cleanup', 'Actually switch the mapped local checkout when cleanup is safe. Requires --cleanup-local.')
+    .option('--confirm-cleanup', 'Actually switch the mapped local checkout when cleanup is safe. Implies --cleanup-local.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: {
-      pr: string;
+    .action(async (opts: {
+      pr?: string;
       issue?: string;
       confirm?: boolean;
       confirmStatus?: boolean;
@@ -685,43 +824,115 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       writeArtifact?: boolean;
       json?: boolean;
     }) => {
-      const result = runPrMerge(workspaceRoot, {
-        pr: opts.pr,
+      const resolvedPr = opts.pr ?? inferPrRefForCurrentBranch(workspaceRoot, invocationCwd);
+      if (!opts.pr && !opts.json) output(`Resolved current branch PR: ${resolvedPr}`);
+      const liveE2EOutput = opts.json
+        ? {}
+        : {
+            e2eStatus: output,
+            e2eOutput: createE2EOutput(output, customOutput),
+          };
+
+      const result = await runPrMerge(workspaceRoot, {
+        pr: resolvedPr,
         issue: opts.issue,
         confirm: opts.confirm,
         confirmStatus: opts.confirmStatus,
         summary: opts.summary,
-        postSummary: opts.postSummary,
+        postSummary: opts.postSummary || opts.confirmSummary,
         confirmSummary: opts.confirmSummary,
-        cleanupLocal: opts.cleanupLocal,
+        cleanupLocal: opts.cleanupLocal || opts.confirmCleanup,
         confirmCleanup: opts.confirmCleanup,
         writeArtifact: opts.writeArtifact,
+        ...liveE2EOutput,
       });
       if (opts.json) {
         printJson(output, result);
         return;
       }
       printPrPlan(output, result);
+
+      let confirmedResult = result;
+      if (interactive && !opts.confirm && !result.merged) {
+        const mergePrompt = result.mergeReadiness?.blocked.length
+          ? 'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? [y/N]'
+          : 'Continue to run the demo Playwright e2e gate and merge this PR now? [y/N]';
+        const continueToMerge = await promptConfirmation(
+          output,
+          input,
+          mergePrompt
+        );
+        if (continueToMerge) {
+          output('Running confirmed PR merge...');
+          confirmedResult = await runPrMerge(workspaceRoot, {
+            pr: resolvedPr,
+            issue: opts.issue,
+            confirm: true,
+            confirmStatus: opts.confirmStatus,
+            summary: opts.summary,
+            postSummary: opts.postSummary || opts.confirmSummary,
+            confirmSummary: opts.confirmSummary,
+            cleanupLocal: opts.cleanupLocal || opts.confirmCleanup,
+            confirmCleanup: opts.confirmCleanup,
+            writeArtifact: opts.writeArtifact,
+            ...liveE2EOutput,
+          });
+          printPrPlan(output, confirmedResult);
+        }
+      }
+
+      if (!interactive || !confirmedResult.merged) return;
+
+      await promptPrMergeFollowUps(workspaceRoot, output, input, {
+        pr: resolvedPr,
+        issue: opts.issue,
+        summary: opts.summary,
+        confirmSummary: opts.confirmSummary,
+        confirmCleanup: opts.confirmCleanup,
+      });
     });
 
   const commit = program.command('commit').description('Commit workflow commands.');
   commit
     .command('create')
     .description('Inspect a child repo and optionally create a conventional commit.')
-    .requiredOption('--repo <id>', 'Repo id from repos.yaml.')
+    .option('--repo <id>', 'Repo id from repos.yaml. Defaults to the current mapped child repo when run inside one.')
     .option('--message <message>', 'Commit message to use.')
     .option('--validate <command>', 'Validation command to run from the target repo before commit. Repeatable.', collect, [])
     .option('--write-artifact', 'Write input/result/summary artifacts under .warroom/runs.')
-    .option('--all', 'Stage all changes before committing. Requires --confirm.')
-    .option('--confirm', 'Actually create the commit.')
+    .option('--all', 'Stage all changes before committing. Requires --confirm or interactive approval.')
+    .option('--no-push', 'Create the commit without pushing to the remote branch.')
+    .option('--confirm', 'Actually create the commit and push it to the remote branch.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { repo: string; message?: string; validate?: string[]; writeArtifact?: boolean; all?: boolean; confirm?: boolean; json?: boolean }) => {
-      const result = runCommitCreate(workspaceRoot, opts);
+    .action(async (opts: { repo?: string; message?: string; validate?: string[]; writeArtifact?: boolean; all?: boolean; push?: boolean; confirm?: boolean; json?: boolean }) => {
+      const commandOptions = { ...opts, currentPath: invocationCwd };
+      const result = runCommitCreate(workspaceRoot, opts.confirm ? commandOptions : { ...commandOptions, confirm: false });
       if (opts.json) {
         printJson(output, result);
         return;
       }
       printCommitCreate(output, result);
+
+      if (opts.confirm || !interactive || result.blocked.length > 0 || result.committed) return;
+
+      const commitAll = opts.all === true || result.changes.some((change) => change.unstaged);
+      const willPush = opts.push !== false;
+      const question = commitAll
+        ? willPush
+          ? 'Commit all listed changes and push to the remote branch now? This will run git add -A before committing. [y/N]'
+          : 'Commit all listed changes now? This will run git add -A before committing. [y/N]'
+        : willPush
+          ? 'Commit staged changes and push to the remote branch now? [y/N]'
+          : 'Commit staged changes now? [y/N]';
+      const confirmed = await promptConfirmation(output, input, question);
+      if (!confirmed) {
+        output('Commit cancelled.');
+        return;
+      }
+
+      output(willPush ? 'Creating commit and pushing...' : 'Creating commit...');
+      const committed = runCommitCreate(workspaceRoot, { ...commandOptions, confirm: true, all: commitAll });
+      printCommitCreate(output, committed);
     });
 
   program
@@ -788,10 +999,18 @@ export function buildProgram(options: BuildProgramOptions = {}) {
   return program;
 }
 
-const currentFile = fileURLToPath(import.meta.url);
-const invokedFile = process.argv[1] ? path.resolve(process.argv[1]) : '';
+function realpathOrResolve(filePath: string) {
+  try {
+    return realpathSync(filePath);
+  } catch {
+    return path.resolve(filePath);
+  }
+}
 
-if (path.resolve(currentFile) === invokedFile) {
+const currentFile = realpathOrResolve(fileURLToPath(import.meta.url));
+const invokedFile = process.argv[1] ? realpathOrResolve(process.argv[1]) : '';
+
+if (currentFile === invokedFile) {
   process.stdout.on('error', (error: NodeJS.ErrnoException) => {
     if (error.code === 'EPIPE') process.exit(0);
     throw error;
