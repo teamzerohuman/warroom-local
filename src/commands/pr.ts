@@ -28,6 +28,7 @@ export type PrOptions = {
   dryRun?: boolean;
   writeArtifact?: boolean;
   confirm?: boolean;
+  skipMergeE2E?: boolean;
   base?: string;
   confirmStatus?: boolean;
   summary?: string;
@@ -317,6 +318,13 @@ function mergePlaywrightRequirement(workspaceRoot: string, githubRepo: string) {
   return repo.merge.playwright
     ? { required: true, skipReason: null }
     : { required: false, skipReason: `repos.yaml has merge.playwright: false for ${githubRepo}.` };
+}
+
+function mergePlaywrightSkipRequirement() {
+  return {
+    required: false,
+    skipReason: 'Skipped by user during interactive merge confirmation.',
+  };
 }
 
 function mergeChangelogRequirement(workspaceRoot: string, githubRepo: string) {
@@ -2742,7 +2750,8 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
   const reviewThreads = listPullRequestReviewThreads(ref);
   const readiness = buildMergeReadiness(pr, reviewThreads);
   const targetBase = pr.baseRefName ?? loadRepoManifest(workspaceRoot).defaults.default_branch;
-  const mergePlaywright = mergePlaywrightRequirement(workspaceRoot, ref.repo);
+  const configuredMergePlaywright = mergePlaywrightRequirement(workspaceRoot, ref.repo);
+  const mergePlaywright = options.skipMergeE2E ? mergePlaywrightSkipRequirement() : configuredMergePlaywright;
   const mergeChangelogRequirementResult = mergeChangelogRequirement(workspaceRoot, ref.repo);
   let mergeE2E = createMergeE2EPlan(workspaceRoot, mergePlaywright);
   let mergeChangelog = createMergeChangelogPlan(workspaceRoot, ref.repo, targetBase, mergeChangelogRequirementResult);

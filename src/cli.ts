@@ -207,6 +207,25 @@ async function promptConfirmation(output: Output, input: Input, question: string
   return false;
 }
 
+async function promptMergeConfirmation(output: Output, input: Input, question: string): Promise<'confirm' | 'skip' | 'cancel'> {
+  output(question);
+
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of readline) {
+      const answer = line.trim().toLowerCase();
+      if (answer === 'y' || answer === 'yes') return 'confirm';
+      if (answer === 's' || answer === 'skip') return 'skip';
+      if (!answer || answer === 'n' || answer === 'no') return 'cancel';
+      output('Enter y to run the gate, skip to merge without Playwright, or n to cancel.');
+    }
+  } finally {
+    readline.close();
+  }
+
+  return 'cancel';
+}
+
 function createE2EOutput(output: Output, customOutput: boolean): E2EOutput {
   if (!customOutput) {
     return (chunk, stream) => {
@@ -1139,20 +1158,31 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
       let confirmedResult = result;
       if (interactive && !opts.confirm && !result.merged) {
-        const mergePrompt = result.mergeReadiness?.blocked.length
-          ? 'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? [y/N]'
-          : 'Continue to run the demo Playwright e2e gate and merge this PR now? [y/N]';
-        const continueToMerge = await promptConfirmation(
-          output,
-          input,
-          mergePrompt
-        );
-        if (continueToMerge) {
-          output('Running confirmed PR merge...');
+        const blocked = (result.mergeReadiness?.blocked.length ?? 0) > 0;
+        let mergeChoice: 'confirm' | 'skip' | 'cancel';
+        if (blocked) {
+          mergeChoice = (await promptConfirmation(
+            output,
+            input,
+            'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? [y/N]'
+          ))
+            ? 'confirm'
+            : 'cancel';
+        } else {
+          mergeChoice = await promptMergeConfirmation(
+            output,
+            input,
+            'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [y/N/skip]'
+          );
+        }
+        if (mergeChoice !== 'cancel') {
+          const skipMergeE2E = mergeChoice === 'skip';
+          output(skipMergeE2E ? 'Running confirmed PR merge without demo Playwright e2e...' : 'Running confirmed PR merge...');
           confirmedResult = await runPrMerge(workspaceRoot, {
             pr: resolvedPr,
             issue: opts.issue,
             confirm: true,
+            skipMergeE2E,
             confirmStatus: opts.confirmStatus,
             summary: opts.summary,
             postSummary: opts.postSummary || opts.confirmSummary,

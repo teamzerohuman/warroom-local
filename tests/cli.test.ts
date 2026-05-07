@@ -1095,7 +1095,9 @@ describe('phase-1 CLI', () => {
       }
 
       expect(lines).toContain('PR merge: preflight only');
-      expect(lines).toContain('Continue to run the demo Playwright e2e gate and merge this PR now? [y/N]');
+      expect(lines).toContain(
+        'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [y/N/skip]'
+      );
       expect(lines).toContain('Running confirmed PR merge...');
       expect(lines).toContain('Merge e2e: passed');
       expect(lines).toContain('Backend process: reused existing');
@@ -1111,6 +1113,47 @@ describe('phase-1 CLI', () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+    }
+  }, 30000);
+
+  it('can skip the demo Playwright e2e gate from the interactive PR merge prompt', async () => {
+    const { root } = makeMergeFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = new PassThrough();
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      const answers = ['skip\n', 'no\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 500);
+      try {
+        await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/backend#655']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
+
+      expect(lines).toContain('PR merge: preflight only');
+      expect(lines).toContain(
+        'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [y/N/skip]'
+      );
+      expect(lines).toContain('Running confirmed PR merge without demo Playwright e2e...');
+      expect(lines).toContain('Merge e2e: skipped (Skipped by user during interactive merge confirmation.)');
+      expect(lines).toContain('Merged: yes');
+      expect(lines.some((line) => line.includes('Demo Playwright e2e: checking backend readiness'))).toBe(false);
+      expect(existsSync(path.join(root, 'backend-started.txt'))).toBe(false);
+    } finally {
+      process.env.PATH = originalPath;
     }
   }, 30000);
 
