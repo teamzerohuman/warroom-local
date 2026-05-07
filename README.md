@@ -56,7 +56,7 @@ npm run warroom -- maps study
 npm run warroom -- issue next
 ```
 
-In an interactive terminal, `issue next` prints numbered ready issues and lets you choose one to start implementation. From a mapped child repo checkout, the list is scoped to that repo by default; add `--all` to show the cross-repo queue. War Room creates a GitHub-linked development branch with `gh issue develop`, moves the selected issue to `battlefield-active`, and hands the work to the configured LLM adapter. Foreground/local adapters check out that branch locally and require a clean checkout; Codex Cloud task adapters skip local checkout, so local dirty files do not block the cloud task. Cloud adapters are instructed to fetch and switch to the prepared branch if their environment starts elsewhere. The command ends with an explicit `Outcome:` line, so it is clear whether the issue was handed off, previewed, blocked, or not started. Add `--dry-run` to preview without creating the branch, launching, or moving status.
+In an interactive terminal, `issue next` prints numbered ready issues and lets you choose one to start implementation. From a mapped child repo checkout, the list is scoped to that repo by default; add `--all` to show the cross-repo queue. War Room creates and checks out a GitHub-linked development branch with `gh issue develop`, moves the selected issue to `battlefield-active`, and hands the work to the configured terminal LLM adapter from the owning child repo. The mapped checkout must be clean before launch. The command ends with an explicit `Outcome:` line, so it is clear whether the issue was handed off, previewed, blocked, or not started. Add `--dry-run` to preview without creating the branch, launching, or moving status.
 
 If you already keep sibling checkouts next to War Room, such as `../sdk` or `../demo`, the CLI can detect those when the mapped `maps/repos/*` checkout is missing. `repos.yaml` remains the ownership map either way.
 
@@ -119,7 +119,7 @@ Use the child repo's own `AGENTS.md`, package manager, and validation commands. 
 warroom commit create --validate "npm test" --write-artifact
 ```
 
-When run interactively from a mapped child checkout, `commit create` first prints a dry run, then asks before staging, committing, and pushing to the remote branch. Pass `--repo <id>` when running from War Room instead of the child repo.
+When run interactively from a mapped child checkout, `commit create` first prints a dry run, then asks before staging, committing, and pushing to the remote branch. After a successful commit, it asks whether to run `warroom pr create` next so the PR can be opened immediately. Pass `--repo <id>` when running from War Room instead of the child repo.
 
 6. Publish the PR on GitHub.
 
@@ -147,7 +147,7 @@ warroom pr merge
 warroom pr merge --issue "$ISSUE" --confirm
 ```
 
-`pr merge` explains merge-readiness blockers, requested reviewers, unresolved review threads, and check state. Without `--confirm`, an interactive preflight asks whether to continue into the confirmed merge path, and the prompt accepts `skip` to continue the merge while skipping the demo Playwright gate. A confirmed merge first reruns merge readiness. For repos with `merge.playwright: true` in `repos.yaml`, it then runs the required demo Playwright `test:e2e` gate against the local backend API unless the interactive skip choice was used, printing backend readiness progress and streaming the Playwright command output in the terminal. Repos with `merge.playwright: false` skip that backend/demo gate. If `merge.changelog: true`, War Room waits for base-branch GitHub Actions after merge, pulls the latest files, asks the LLM to update `CHANGELOG.md`, and pushes a `[skip-ci]` changelog commit to the base branch. After a successful interactive merge, War Room prompts to post the victory summary and then prompts for local cleanup.
+`pr merge` explains merge-readiness blockers, requested reviewers, unresolved review threads, and check state. Without `--confirm`, an interactive preflight asks whether to continue into the confirmed merge path. If the preflight is blocked, type `skip` to allow unresolved review threads only when no other blockers remain. If the preflight is clear, type `skip` to continue the merge while skipping the demo Playwright gate. A confirmed merge first reruns merge readiness. For repos with `merge.playwright: true` in `repos.yaml`, it then runs the required demo Playwright `test:e2e` gate against the local backend API unless the clear-preflight skip choice was used, printing backend readiness progress and streaming the Playwright command output in the terminal. Repos with `merge.playwright: false` skip that backend/demo gate. If `merge.changelog: true`, War Room waits for base-branch GitHub Actions after merge, pulls the latest files, asks the LLM to update `CHANGELOG.md`, and pushes a `[skip-ci]` changelog commit to the base branch. After a successful interactive merge, War Room prompts to post the victory summary and then prompts for local cleanup, which switches to the PR base branch and pulls it with `git pull --ff-only`.
 
 If work becomes blocked, mark it explicitly:
 

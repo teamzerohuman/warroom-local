@@ -135,7 +135,7 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('Closes TeamFloPay/sdk#7'))).toBe(true);
       expect(lines.some((line) => line.includes('Do not stop after writing a plan'))).toBe(true);
       expect(lines.some((line) => line.includes('git fetch origin warroom/7-build-the-selector'))).toBe(true);
-      expect(lines.some((line) => line.includes('Remote/cloud adapters may start on another branch'))).toBe(true);
+      expect(lines.some((line) => line.includes('War Room should have checked this checkout out to warroom/7-build-the-selector'))).toBe(true);
       expect(lines.some((line) => line.includes('Triage complete: build the feature directly.'))).toBe(true);
       expect(lines.at(-1)).toBe('Outcome: handed off to LLM adapter on warroom/7-build-the-selector. Campaign status updated to battlefield-active.');
 
@@ -149,13 +149,13 @@ describe('phase-1 CLI', () => {
     }
   });
 
-  it('can start implementation through Codex Cloud adapter', async () => {
+  it('treats legacy Codex Cloud config as a local Codex implementation launch', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
     writeCodexFixture(bin);
-    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\nCODEX_CLOUD_ENV_SDK=env_fixture\n');
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\n');
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
@@ -168,9 +168,11 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('Starting TeamFloPay/sdk#7');
       expect(lines).toContain('Issue start: launched');
-      expect(lines.some((line) => line.includes('Adapter: codex cloud exec --env env_fixture <prompt>'))).toBe(true);
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.includes('codex cloud exec'))).toBe(false);
+      expect(lines.some((line) => line.includes('gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
       expect(lines.some((line) => line.includes('git switch -c warroom/7-build-the-selector --track origin/warroom/7-build-the-selector'))).toBe(true);
-      expect(lines.some((line) => line.includes('not a blocker unless the fetch/switch fails'))).toBe(true);
+      expect(lines.some((line) => line.includes('not a blocker unless the fetch/switch fails'))).toBe(false);
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
       expect(lines.at(-1)).toBe('Outcome: handed off to LLM adapter on warroom/7-build-the-selector. Campaign status updated to battlefield-active.');
     } finally {
@@ -178,14 +180,14 @@ describe('phase-1 CLI', () => {
     }
   });
 
-  it('starts Codex Cloud implementation without requiring a clean local checkout', async () => {
+  it('requires a clean local checkout even when legacy Codex Cloud config is present', async () => {
     const root = makeDevFixture();
     const sdk = path.resolve(root, '..', 'sdk');
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
     writeCodexFixture(bin);
-    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\nCODEX_CLOUD_ENV_SDK=env_fixture\n');
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\n');
     writeFileSync(path.join(sdk, 'dirty-local-note.md'), 'local work in progress\n');
 
     const originalPath = process.env.PATH;
@@ -197,14 +199,14 @@ describe('phase-1 CLI', () => {
 
       await program.parseAsync(['node', 'warroom', 'issue', 'next', '--issue', 'TeamFloPay/sdk#7', '--confirm-status']);
 
-      expect(lines).toContain('Issue start: launched');
-      expect(lines.some((line) => line.includes('Adapter error:'))).toBe(false);
-      expect(lines).toContain('Development branch: ready warroom/7-build-the-selector from main');
-      expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector'))).toBe(true);
-      expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(false);
-      expect(lines).toContain('Development checkout: not required for task adapter');
-      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
-      expect(lines.at(-1)).toBe('Outcome: handed off to LLM adapter on warroom/7-build-the-selector. Campaign status updated to battlefield-active.');
+      expect(lines).toContain('Issue start: blocked');
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines).toContain('Development branch: planned warroom/7-build-the-selector from main');
+      expect(lines.some((line) => line.includes('Development branch link: planned gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
+      expect(lines.some((line) => line.startsWith('Development checkout: not checked out'))).toBe(true);
+      expect(lines.some((line) => line.includes('branch blocked: Mapped checkout has local changes.'))).toBe(true);
+      expect(lines.some((line) => line.includes('Campaign status: updated'))).toBe(false);
+      expect(lines.at(-1)).toBe('Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.');
 
       const branch = spawnSync('git', ['branch', '--show-current'], { cwd: sdk, encoding: 'utf8' });
       expect(branch.stdout.trim()).toBe('main');
@@ -529,14 +531,14 @@ describe('phase-1 CLI', () => {
     }
   });
 
-  it('uses the foreground adapter for PR review even when Codex Cloud is configured', async () => {
+  it('uses the local adapter for PR review when legacy Codex Cloud config is present', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
     const stateFile = path.join(root, 'review-state.txt');
     mkdirSync(bin, { recursive: true });
     writePrReviewLoopGhFixture(bin, stateFile, { queue: 'multi', outstandingFirst: false });
     writePrReviewLoopCodexFixture(bin, stateFile);
-    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\nCODEX_CLOUD_ENV_SDK=env_fixture\n');
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\n');
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
@@ -582,35 +584,25 @@ describe('phase-1 CLI', () => {
     }
   });
 
-  it('explains incomplete Codex Cloud setup when the environment id is missing', () => {
+  it('reports legacy Codex Cloud config as a deprecated local adapter alias', () => {
     const root = makeDevFixture();
-    const home = path.join(root, 'home');
-    mkdirSync(path.join(home, '.codex'), { recursive: true });
     writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\n');
-    writeFileSync(
-      path.join(home, '.codex', '.codex-global-state.json'),
-      JSON.stringify({ 'electron-persisted-atom-state': { codexCloudAccess: 'enabled_needs_setup' } })
-    );
 
-    const originalHome = process.env.HOME;
-    process.env.HOME = home;
+    const result = getEnvStatus(root);
 
-    try {
-      const result = getEnvStatus(root);
-
-      expect(result.notes.some((note) => note.includes('CODEX_CLOUD_ENV or repo-specific CODEX_CLOUD_ENV_<REPO_ID>'))).toBe(true);
-      expect(result.notes.some((note) => note.includes('Codex Cloud is enabled but still needs setup'))).toBe(true);
-    } finally {
-      process.env.HOME = originalHome;
-    }
+    expect(result.adapterSupported).toBe(true);
+    expect(result.notes.some((note) => note.includes('LLM_ADAPTER=codex-cloud is deprecated'))).toBe(true);
+    expect(result.notes.some((note) => note.includes('CODEX_CLOUD_ENV'))).toBe(false);
   });
 
-  it('requires the owning repo Codex Cloud environment for mapped launches', () => {
+  it('does not require Codex Cloud environment ids for adapter launches', () => {
     const root = makeDevFixture();
-    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\nCODEX_CLOUD_ENV_BACKEND=env_backend\n');
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\n');
 
-    expect(() => getAdapterInvocation(root, root, { repoId: 'sdk' })).toThrow(/CODEX_CLOUD_ENV_SDK is required/);
-    expect(getAdapterInvocation(root, root, { repoId: 'backend' }).display).toContain('codex cloud exec --env env_backend <prompt>');
+    const invocation = getAdapterInvocation(root, root);
+    expect(invocation.mode).toBe('foreground');
+    expect(invocation.display).toContain('codex exec --cd');
+    expect(invocation.display).not.toContain('codex cloud exec');
   });
 
   it('passes .env.local values into local adapter launches', () => {
@@ -762,16 +754,28 @@ describe('phase-1 CLI', () => {
     writeFileSync(path.join(sdk, 'index.ts'), 'export const value = 1;\n');
 
     const lines: string[] = [];
-    const input = Readable.from(['yes\n']);
+    const input = new PassThrough();
     const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line), input, interactive: true });
 
-    await program.parseAsync(['node', 'warroom', 'commit', 'create', '--message', 'chore(sdk): save fixture']);
+    const answers = ['yes\n', 'no\n'];
+    const promptAnswers = setInterval(() => {
+      const answer = answers.shift();
+      if (answer) input.write(answer);
+      else clearInterval(promptAnswers);
+    }, 100);
+    try {
+      await program.parseAsync(['node', 'warroom', 'commit', 'create', '--message', 'chore(sdk): save fixture']);
+    } finally {
+      clearInterval(promptAnswers);
+      input.end();
+    }
 
     expect(lines).toContain('Commit create for sdk: preflight only');
     expect(lines).toContain('Commit all listed changes and push to the remote branch now? This will run git add -A before committing. [y/N]');
     expect(lines).toContain('Creating commit and pushing...');
     expect(lines).toContain('Commit create for sdk: committed');
     expect(lines).toContain('Push: pushed git push -u origin HEAD');
+    expect(lines).toContain('Run `warroom pr create` next? [y/N]');
 
     const log = spawnSync('git', ['log', '-1', '--pretty=%s'], { cwd: sdk, encoding: 'utf8' });
     expect(log.stdout.trim()).toBe('chore(sdk): save fixture');
@@ -781,6 +785,47 @@ describe('phase-1 CLI', () => {
 
     const status = spawnSync('git', ['status', '--short'], { cwd: sdk, encoding: 'utf8' });
     expect(status.stdout.trim()).toBe('');
+  });
+
+  it('can open a PR directly after an interactive commit', async () => {
+    const { root, sdk } = makeCommitFixture();
+    const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
+    if (branch.status !== 0) throw new Error(branch.stderr);
+    writeFileSync(path.join(sdk, 'index.ts'), 'export const value = 1;\n');
+
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = new PassThrough();
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line), input, interactive: true });
+
+      const answers = ['yes\n', 'yes\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'commit', 'create', '--message', 'chore(sdk): save fixture']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
+
+      expect(lines).toContain('Commit create for sdk: committed');
+      expect(lines).toContain('Run `warroom pr create` next? [y/N]');
+      expect(lines).toContain('Creating PR...');
+      expect(lines).toContain('PR create: created');
+      expect(lines).toContain('PR URL: https://github.com/TeamFloPay/sdk/pull/12');
+    } finally {
+      process.env.PATH = originalPath;
+    }
   });
 
   it('reuses an existing backend before confirming PR merge e2e validation', async () => {
@@ -1045,6 +1090,48 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('can allow unresolved review threads from the blocked PR merge prompt', async () => {
+    const { root } = makeMergeFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeUnresolvedThreadMergeGhFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = new PassThrough();
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      const answers = ['skip\n', 'no\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/infra#4']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
+
+      expect(lines).toContain('PR merge: preflight only');
+      expect(lines).toContain(
+        'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [y/N/skip]'
+      );
+      expect(lines).toContain('Running confirmed PR merge while allowing unresolved review threads...');
+      expect(lines).toContain('Merge readiness: clear');
+      expect(lines).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/infra.)');
+      expect(lines).toContain('Merged: yes');
+      expect(lines).toContain('Post victory summary comments now? [y/N]');
+      expect(lines).toContain('Return the local checkout to the PR base branch now? [y/N]');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
   it('prompts to continue from PR merge preflight into the confirmed merge flow', async () => {
     const { root } = makeMergeFixture();
     const bin = path.join(root, 'bin');
@@ -1158,10 +1245,22 @@ describe('phase-1 CLI', () => {
   }, 30000);
 
   it('infers the current branch PR and prompts for merge follow-up actions', async () => {
-    const { root, backend } = makeMergeFixture();
+    const { root, backend, backendRemote } = makeMergeFixture();
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
+    const remoteMain = path.join(root, 'backend-remote-main');
+    let remoteResult = spawnSync('git', ['clone', '--branch', 'main', backendRemote, remoteMain], { encoding: 'utf8' });
+    if (remoteResult.status !== 0) throw new Error(remoteResult.stderr);
+    spawnSync('git', ['config', 'user.email', 'warroom@example.com'], { cwd: remoteMain });
+    spawnSync('git', ['config', 'user.name', 'War Room'], { cwd: remoteMain });
+    writeFileSync(path.join(remoteMain, 'README.md'), 'Updated on main after merge.\n');
+    remoteResult = spawnSync('git', ['add', 'README.md'], { cwd: remoteMain, encoding: 'utf8' });
+    if (remoteResult.status !== 0) throw new Error(remoteResult.stderr);
+    remoteResult = spawnSync('git', ['commit', '-m', 'docs: update main'], { cwd: remoteMain, encoding: 'utf8' });
+    if (remoteResult.status !== 0) throw new Error(remoteResult.stderr);
+    remoteResult = spawnSync('git', ['push', 'origin', 'main'], { cwd: remoteMain, encoding: 'utf8' });
+    if (remoteResult.status !== 0) throw new Error(remoteResult.stderr);
 
     const backendPort = 39_153;
     const demoPort = 39_154;
@@ -1207,9 +1306,12 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Summary issue: posted TeamFloPay/backend#562 https://github.com/TeamFloPay/backend/issues/562#issuecomment-2');
       expect(lines).toContain('Return the local checkout to the PR base branch now? [y/N]');
       expect(lines).toContain('Local cleanup: applied TeamFloPay/backend');
+      expect(lines).toContain('cleanup: Switched local checkout to main.');
+      expect(lines).toContain('cleanup: Pulled latest main with git pull --ff-only.');
 
       const branch = spawnSync('git', ['branch', '--show-current'], { cwd: backend, encoding: 'utf8' });
       expect(branch.stdout.trim()).toBe('main');
+      expect(readFileSync(path.join(backend, 'README.md'), 'utf8')).toBe('Updated on main after merge.\n');
     } finally {
       await stopChild(existingBackend);
       process.env.PATH = originalPath;
@@ -1380,11 +1482,14 @@ function makeMergeFixture() {
   const root = path.join(base, 'warroom');
   const backend = path.join(base, 'backend');
   const demo = path.join(base, 'demo');
+  const backendRemote = path.join(base, 'backend-remote.git');
 
   mkdirSync(root, { recursive: true });
   mkdirSync(path.join(root, 'maps', 'repos'), { recursive: true });
   initGitRepo(backend);
   initGitRepo(demo);
+  initBareRemote(backendRemote);
+  spawnSync('git', ['remote', 'add', 'origin', backendRemote], { cwd: backend });
 
   writeFileSync(
     path.join(root, 'repos.yaml'),
@@ -1499,10 +1604,12 @@ console.log('demo e2e passed');
   );
   commitAll(backend, 'fixture backend');
   commitAll(demo, 'fixture demo');
+  const pushMain = spawnSync('git', ['push', '-u', 'origin', 'main'], { cwd: backend, encoding: 'utf8' });
+  if (pushMain.status !== 0) throw new Error(pushMain.stderr);
   const branch = spawnSync('git', ['switch', '-c', 'feature/backend'], { cwd: backend, encoding: 'utf8' });
   if (branch.status !== 0) throw new Error(branch.stderr);
 
-  return { root, backend, demo };
+  return { root, backend, demo, backendRemote };
 }
 
 function makeChangelogMergeFixture() {
@@ -2470,22 +2577,94 @@ process.exit(1);
   chmodSync(ghPath, 0o755);
 }
 
+function writeUnresolvedThreadMergeGhFixture(bin: string) {
+  const ghPath = path.join(bin, 'gh');
+  writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+
+function json(value) {
+  process.stdout.write(JSON.stringify(value));
+}
+
+if (args[0] === 'pr' && args[1] === 'view') {
+  json({
+    title: 'Infra cleanup PR',
+    url: 'https://github.com/TeamFloPay/infra/pull/4',
+    mergeStateStatus: 'BLOCKED',
+    mergeable: 'MERGEABLE',
+    reviewDecision: '',
+    headRefName: 'feature/infra',
+    baseRefName: 'main',
+    isDraft: false,
+    reviewRequests: [],
+    latestReviews: [
+      {
+        author: { login: 'coderabbitai' },
+        state: 'COMMENTED',
+        submittedAt: '2026-05-06T07:58:39Z'
+      }
+    ],
+    statusCheckRollup: [
+      {
+        name: 'Terraform plan',
+        status: 'COMPLETED',
+        conclusion: 'SUCCESS',
+        detailsUrl: 'https://github.com/TeamFloPay/infra/actions/runs/1'
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'api' && args[1] === 'graphql') {
+  json({
+    data: {
+      repository: {
+        pullRequest: {
+          reviewThreads: {
+            nodes: [
+              {
+                isResolved: false,
+                isOutdated: false,
+                comments: {
+                  nodes: [
+                    {
+                      path: 'main.tf',
+                      line: 12,
+                      url: 'https://github.com/TeamFloPay/infra/pull/4#discussion_r1',
+                      body: 'Consider renaming this local variable.',
+                      author: { login: 'coderabbitai' }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'merge') {
+  process.exit(0);
+}
+
+console.error('Unexpected gh fixture call: ' + args.join(' '));
+process.exit(1);
+`
+  );
+  chmodSync(ghPath, 0o755);
+}
+
 function writeCodexFixture(bin: string) {
   const codexPath = path.join(bin, 'codex');
   writeFileSync(
     codexPath,
     `#!/usr/bin/env node
-const args = process.argv.slice(2);
-
-if (args[0] === 'cloud' && args[1] === 'exec' && args[2] === '--env' && args[3]) {
-  if (!args[4]) {
-    console.error('missing prompt');
-    process.exit(1);
-  }
-  console.log('submitted cloud task');
-  process.exit(0);
-}
-
 process.stdin.resume();
 process.stdin.on('end', () => process.exit(0));
 `

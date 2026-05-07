@@ -226,6 +226,25 @@ async function promptMergeConfirmation(output: Output, input: Input, question: s
   return 'cancel';
 }
 
+async function promptBlockedMergeConfirmation(output: Output, input: Input, question: string): Promise<'confirm' | 'skip' | 'cancel'> {
+  output(question);
+
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of readline) {
+      const answer = line.trim().toLowerCase();
+      if (answer === 'y' || answer === 'yes') return 'confirm';
+      if (answer === 's' || answer === 'skip') return 'skip';
+      if (!answer || answer === 'n' || answer === 'no') return 'cancel';
+      output('Enter y to recheck blockers, skip to allow unresolved review threads, or n to cancel.');
+    }
+  } finally {
+    readline.close();
+  }
+
+  return 'cancel';
+}
+
 function createE2EOutput(output: Output, customOutput: boolean): E2EOutput {
   if (!customOutput) {
     return (chunk, stream) => {
@@ -324,7 +343,7 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     output(`Development branch: ${branch.applied ? 'ready' : 'planned'} ${branch.branch} from ${branch.base}`);
     output(`Development branch link: ${branch.linked ? 'created' : 'planned'} ${branch.command}`);
     output(
-      `Development checkout: ${branch.checkoutRequired ? branch.checkedOut ? 'checked out' : branch.path ? `not checked out (${branch.path})` : 'missing checkout' : 'not required for task adapter'}`
+      `Development checkout: ${branch.checkoutRequired ? branch.checkedOut ? 'checked out' : branch.path ? `not checked out (${branch.path})` : 'missing checkout' : 'not checked out'}`
     );
     for (const blocker of branch.blocked) output(`branch blocked: ${blocker}`);
     if (branch.error) output(`branch error: ${branch.error}`);
@@ -522,6 +541,30 @@ function printCommitCreate(output: Output, result: CommitCreateResult) {
     );
   }
   for (const blocker of result.blocked) output(`blocked: ${blocker}`);
+}
+
+async function promptPrCreateAfterCommit(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  result: CommitCreateResult
+) {
+  if (!result.committed) return;
+
+  const createPr = await promptConfirmation(output, input, 'Run `warroom pr create` next? [y/N]');
+  if (!createPr) return;
+
+  output('Creating PR...');
+  try {
+    const created = runPrCreate(workspaceRoot, {
+      confirm: true,
+      currentPath: result.path,
+    });
+    printPrCreate(output, created);
+  } catch (error) {
+    output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
 }
 
 function printAbort(output: Output, result: AbortResult) {
@@ -1109,8 +1152,8 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--summary <text>', 'Victory summary to include in local artifacts and optional comments.')
     .option('--post-summary', 'Plan or post victory summary comments to the PR and linked issue.')
     .option('--confirm-summary', 'Actually post victory summary comments. Implies --post-summary.')
-    .option('--cleanup-local', 'Plan or return the mapped local checkout to the PR base branch.')
-    .option('--confirm-cleanup', 'Actually switch the mapped local checkout when cleanup is safe. Implies --cleanup-local.')
+    .option('--cleanup-local', 'Plan or return the mapped local checkout to the PR base branch and pull it.')
+    .option('--confirm-cleanup', 'Actually switch the mapped local checkout and pull when cleanup is safe. Implies --cleanup-local.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
     .action(async (opts: {
@@ -1159,30 +1202,38 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       let confirmedResult = result;
       if (interactive && !opts.confirm && !result.merged) {
         const blocked = (result.mergeReadiness?.blocked.length ?? 0) > 0;
+        let allowUnresolvedReviewThreads = false;
+        let skipMergeE2E = false;
         let mergeChoice: 'confirm' | 'skip' | 'cancel';
         if (blocked) {
-          mergeChoice = (await promptConfirmation(
+          mergeChoice = await promptBlockedMergeConfirmation(
             output,
             input,
-            'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? [y/N]'
-          ))
-            ? 'confirm'
-            : 'cancel';
+            'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [y/N/skip]'
+          );
+          allowUnresolvedReviewThreads = mergeChoice === 'skip';
         } else {
           mergeChoice = await promptMergeConfirmation(
             output,
             input,
             'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [y/N/skip]'
           );
+          skipMergeE2E = mergeChoice === 'skip';
         }
         if (mergeChoice !== 'cancel') {
-          const skipMergeE2E = mergeChoice === 'skip';
-          output(skipMergeE2E ? 'Running confirmed PR merge without demo Playwright e2e...' : 'Running confirmed PR merge...');
+          output(
+            allowUnresolvedReviewThreads
+              ? 'Running confirmed PR merge while allowing unresolved review threads...'
+              : skipMergeE2E
+                ? 'Running confirmed PR merge without demo Playwright e2e...'
+                : 'Running confirmed PR merge...'
+          );
           confirmedResult = await runPrMerge(workspaceRoot, {
             pr: resolvedPr,
             issue: opts.issue,
             confirm: true,
             skipMergeE2E,
+            allowUnresolvedReviewThreads,
             confirmStatus: opts.confirmStatus,
             summary: opts.summary,
             postSummary: opts.postSummary || opts.confirmSummary,
@@ -1230,7 +1281,14 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       }
       printCommitCreate(output, result);
 
-      if (opts.confirm || !interactive || result.blocked.length > 0 || result.committed) return;
+      if (!interactive) return;
+
+      if (opts.confirm || result.committed) {
+        await promptPrCreateAfterCommit(workspaceRoot, output, input, result);
+        return;
+      }
+
+      if (result.blocked.length > 0) return;
 
       const commitAll = opts.all === true || result.changes.some((change) => change.unstaged);
       const willPush = opts.push !== false;
@@ -1250,6 +1308,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       output(willPush ? 'Creating commit and pushing...' : 'Creating commit...');
       const committed = runCommitCreate(workspaceRoot, { ...commandOptions, confirm: true, all: commitAll });
       printCommitCreate(output, committed);
+      await promptPrCreateAfterCommit(workspaceRoot, output, input, committed);
     });
 
   program

@@ -161,10 +161,6 @@ function repoWorkspaceForGitHub(workspaceRoot: string, githubRepo: string) {
   return health.checkedOut ? health.resolvedPath : workspaceRoot;
 }
 
-function repoIdForGitHub(workspaceRoot: string, githubRepo: string) {
-  return repoEntryForGitHub(workspaceRoot, githubRepo)?.id ?? null;
-}
-
 export function runIssueNext(workspaceRoot: string, options: IssueNextOptions | string = {}) {
   const label = typeof options === 'string' ? options : options.label ?? 'ready-to-engage';
   const currentRepo = typeof options === 'string' || options.allRepos ? null : repoForCurrentPath(workspaceRoot, options.currentPath);
@@ -204,8 +200,7 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
       })
     : null;
   const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
-  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
-  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId }).display;
+  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd).display;
   const campaignStatus = options.markReady
     ? setCampaignStatus(options.issue, 'ready-to-engage', { confirm: options.confirmStatus })
     : null;
@@ -215,6 +210,6 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     return { prompt, artifact, launched: false, adapterCommand, campaignStatus, contextSummary };
   }
 
-  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId });
+  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
   return { prompt, artifact, launched: launch.launched, adapterCommand: launch.invocation.display, campaignStatus, contextSummary, launchError: launch.error };
 }

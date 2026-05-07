@@ -37,6 +37,7 @@ export type PrOptions = {
   cleanupLocal?: boolean;
   confirmCleanup?: boolean;
   checkInMinutes?: number;
+  allowUnresolvedReviewThreads?: boolean;
   issueTitle?: string;
   issueUrl?: string;
   currentPath?: string;
@@ -1027,7 +1028,7 @@ function buildMergeReadiness(pr: {
     detailsUrl?: string;
     targetUrl?: string;
   }>;
-}, unresolvedReviewThreads: MergeReadiness['unresolvedReviewThreads'] = []): MergeReadiness {
+}, unresolvedReviewThreads: MergeReadiness['unresolvedReviewThreads'] = [], options: { allowUnresolvedReviewThreads?: boolean } = {}): MergeReadiness {
   const checks = (pr.statusCheckRollup ?? [])
     .filter((check) => check.name || check.context || check.status || check.conclusion || check.state || check.workflowName)
     .map((check) => ({
@@ -1075,7 +1076,20 @@ function buildMergeReadiness(pr: {
       'Mark the PR ready for review in GitHub, then rerun `warroom pr merge`.'
     );
   }
-  if (mergeStateStatus && ['BLOCKED', 'BEHIND', 'DIRTY', 'DRAFT', 'UNKNOWN'].includes(mergeStateStatus)) {
+  const mergeStateBlockedOnlyByAllowedThreads =
+    options.allowUnresolvedReviewThreads === true &&
+    mergeStateStatus === 'BLOCKED' &&
+    currentUnresolvedThreads.length > 0 &&
+    requestedReviewers.length === 0 &&
+    !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes((reviewDecision ?? '').toUpperCase()) &&
+    failedChecks.length === 0 &&
+    incompleteChecks.length === 0;
+
+  if (
+    mergeStateStatus &&
+    ['BLOCKED', 'BEHIND', 'DIRTY', 'DRAFT', 'UNKNOWN'].includes(mergeStateStatus) &&
+    !mergeStateBlockedOnlyByAllowedThreads
+  ) {
     const evidence: string[] = [];
     if (mergeable) evidence.push(`GitHub mergeable value: ${mergeable}.`);
     if (requestedReviewers.length > 0) evidence.push(`Requested review still pending from: ${requestedReviewers.join(', ')}.`);
@@ -1131,7 +1145,7 @@ function buildMergeReadiness(pr: {
     );
   }
 
-  if (currentUnresolvedThreads.length > 0) {
+  if (currentUnresolvedThreads.length > 0 && !options.allowUnresolvedReviewThreads) {
     addBlocker(
       'Current review threads are unresolved.',
       'At least one non-outdated review conversation is still unresolved.',
@@ -2186,9 +2200,8 @@ async function runMergeChangelog(
       versions,
       changelog: readFileSync(plan.changelogPath, 'utf8'),
     });
-    const repoId = repoIdForGitHub(workspaceRoot, plan.repo);
     options.mergeStatus?.('Changelog: asking the LLM to update CHANGELOG.md');
-    const adapter = runAdapter(workspaceRoot, prompt, { cwd: plan.path, repoId, forceForeground: true });
+    const adapter = runAdapter(workspaceRoot, prompt, { cwd: plan.path });
     if (!adapter.launched) throw new Error(adapter.error ?? 'LLM adapter failed to update CHANGELOG.md.');
 
     const changed = gitStatusPaths(plan.path);
@@ -2382,13 +2395,26 @@ function planLocalCleanup(
   if (repo.branch === targetBranch) messages.push(`Already on ${targetBranch}.`);
 
   let applied = false;
-  if (options.confirmCleanup && blocked.length === 0 && repo.branch !== targetBranch) {
-    const switched = runGit(repo.resolvedPath, ['switch', targetBranch]);
-    if (switched.status !== 0) {
-      blocked.push(switched.stderr || `git switch ${targetBranch} failed with exit ${switched.status ?? 'unknown'}.`);
-    } else {
-      applied = true;
-      messages.push(`Switched local checkout to ${targetBranch}.`);
+  if (options.confirmCleanup && blocked.length === 0) {
+    let onTargetBranch = repo.branch === targetBranch;
+    if (!onTargetBranch) {
+      const switched = runGit(repo.resolvedPath, ['switch', targetBranch]);
+      if (switched.status !== 0) {
+        blocked.push(switched.stderr || `git switch ${targetBranch} failed with exit ${switched.status ?? 'unknown'}.`);
+      } else {
+        onTargetBranch = true;
+        messages.push(`Switched local checkout to ${targetBranch}.`);
+      }
+    }
+
+    if (onTargetBranch && blocked.length === 0) {
+      const pulled = runGit(repo.resolvedPath, ['pull', '--ff-only']);
+      if (pulled.status !== 0) {
+        blocked.push(pulled.stderr || `git pull --ff-only failed with exit ${pulled.status ?? 'unknown'}.`);
+      } else {
+        applied = true;
+        messages.push(`Pulled latest ${targetBranch} with git pull --ff-only.`);
+      }
     }
   } else if (!options.confirmCleanup && repo.branch !== targetBranch) {
     messages.push('Pass --confirm-cleanup to switch the local checkout when the preflight is clear.');
@@ -2422,16 +2448,14 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
   const base = options.base ?? 'main';
   const featureBranch = featureBranchForIssue(ref, title);
   const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
-  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
-  const adapterInvocation = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId });
-  const requiresLocalCheckout = adapterInvocation.mode !== 'task';
+  const adapterInvocation = getAdapterInvocation(workspaceRoot, adapterCwd);
   const developmentBranch = createDevelopmentBranchResult(
     workspaceRoot,
     ref,
     title,
     base,
     options.dryRun === false,
-    requiresLocalCheckout
+    true
   );
   const issueCommentRows = (issue.comments ?? []).map((comment, index) => {
     const author = comment.author?.login ?? 'unknown';
@@ -2452,7 +2476,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     'Mission:',
     '- Implement the issue now. Do not stop after writing a plan, preflight, analysis note, or handoff markdown.',
     `- Use the already prepared GitHub-linked development branch ${featureBranch}.`,
-    `- Before editing, verify the current branch. If this checkout is not already on ${featureBranch}, run \`git fetch origin ${featureBranch}\`, then \`git switch ${featureBranch}\` or \`git switch -c ${featureBranch} --track origin/${featureBranch}\`. Remote/cloud adapters may start on another branch; that is not a blocker unless the fetch/switch fails.`,
+    `- Before editing, verify the current branch. War Room should have checked this checkout out to ${featureBranch}; if it is not already on that branch, run \`git fetch origin ${featureBranch}\`, then \`git switch ${featureBranch}\` or \`git switch -c ${featureBranch} --track origin/${featureBranch}\` before editing.`,
     '- Read and follow the repository AGENTS.md plus referenced development/testing instructions before editing.',
     '- Use the existing issue body and GitHub discussion as the accepted triage context.',
     '- Make the required code, test, and product documentation changes in this owning child repo.',
@@ -2501,7 +2525,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
   if (options.dryRun !== false) {
     return { prompt, artifact, launched: false, adapterCommand, action: 'issue-start', campaignStatus, developmentBranch, contextSummary, adapterCwd };
   }
-  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId });
+  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
   return {
     prompt,
     artifact,
@@ -2540,7 +2564,6 @@ async function runCodeRabbitPrReviewLoop(
   ref: { repo: string; number: number },
   prompt: string,
   adapterCwd: string,
-  adapterRepoId: string | null,
   initialSnapshot: PrReviewSnapshot,
   options: PrOptions
 ): Promise<{ loop: PrReviewLoopResult; launched: boolean; adapterCommand: string | null; launchError: string | null }> {
@@ -2562,7 +2585,7 @@ async function runCodeRabbitPrReviewLoop(
 
   for (let index = 1; index <= config.maxLoops; index += 1) {
     options.reviewStatus?.(`PR review loop ${index}: launching adapter for ${ref.repo}#${ref.number}.`);
-    const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId, forceForeground: true });
+    const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
     adapterCommand = launch.invocation.display;
     const iteration: PrReviewLoopResult['iterations'][number] = {
       iteration: index,
@@ -2670,8 +2693,7 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
       })
     : null;
   const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
-  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
-  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId, forceForeground: true }).display;
+  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd).display;
   const campaignStatus = options.issue
     ? setCampaignStatus(options.issue, 'skirmish', { confirm: options.confirmStatus })
     : null;
@@ -2694,7 +2716,7 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
     };
   }
 
-  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prompt, adapterCwd, adapterRepoId, pr, options);
+  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prompt, adapterCwd, pr, options);
   return {
     prompt,
     artifact,
@@ -2748,7 +2770,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     {}
   );
   const reviewThreads = listPullRequestReviewThreads(ref);
-  const readiness = buildMergeReadiness(pr, reviewThreads);
+  const readiness = buildMergeReadiness(pr, reviewThreads, {
+    allowUnresolvedReviewThreads: options.allowUnresolvedReviewThreads,
+  });
   const targetBase = pr.baseRefName ?? loadRepoManifest(workspaceRoot).defaults.default_branch;
   const configuredMergePlaywright = mergePlaywrightRequirement(workspaceRoot, ref.repo);
   const mergePlaywright = options.skipMergeE2E ? mergePlaywrightSkipRequirement() : configuredMergePlaywright;
@@ -2776,7 +2800,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
         .join('\n')
     : 'none';
   const requiredMergeChecks = [
-    '- Confirm all review and CodeRabbit feedback loops are resolved.',
+    options.allowUnresolvedReviewThreads
+      ? '- Unresolved review threads were explicitly allowed for this merge attempt.'
+      : '- Confirm all review and CodeRabbit feedback loops are resolved.',
     '- Confirm validation status and target branch.',
     mergeE2E.required
       ? `- Run full demo Playwright e2e: start backend with \`${mergeE2E.backendCommand}\`, wait for ${mergeE2E.backendReadyUrl}, then run \`${mergeE2E.demoCommand}\` from the demo repo.`
