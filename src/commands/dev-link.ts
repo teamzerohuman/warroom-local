@@ -37,11 +37,16 @@ export type PackageLinkStatus = {
   linkPath: string;
   targetPath: string;
   sdkPackagePath: string;
+  mirrorPackageJsonExists: boolean;
+  mirrorDistPath: string;
+  mirrorDistTarget: string | null;
+  mirrorDistLinked: boolean;
   buildOutputExists: boolean;
   exists: boolean;
   isSymlink: boolean;
   actualTarget: string | null;
   linked: boolean;
+  staleMirror: boolean;
   legacyDirectLinked: boolean;
 };
 
@@ -60,6 +65,7 @@ export type DevStatus = {
   packages: PackageLinkStatus[];
   linked: boolean;
   partiallyLinked: boolean;
+  staleMirror: boolean;
   legacyDirectLinked: boolean;
   ready: boolean;
   recommended: {
@@ -190,6 +196,15 @@ function samePath(left: string | null, right: string) {
   return safeRealpath(left) === safeRealpath(right);
 }
 
+function pathEntryExists(filePath: string) {
+  try {
+    lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function getPackageMirrorPath(workspaceRoot: string, packageName: string) {
   return path.join(workspaceRoot, MIRROR_DIR, packageName);
 }
@@ -203,19 +218,31 @@ function getPackageLinkStatus(
   const linkPath = path.join(demoPath, 'node_modules', '@flopay', packageName);
   const sdkPackagePath = path.join(sdkPath, 'packages', packageName);
   const targetPath = getPackageMirrorPath(workspaceRoot, packageName);
+  const mirrorPackageJsonExists = existsSync(path.join(targetPath, 'package.json'));
+  const mirrorDistPath = path.join(targetPath, 'dist');
+  const expectedMirrorDistTarget = path.join(sdkPackagePath, 'dist');
+  const mirrorDistExists = pathEntryExists(mirrorDistPath);
+  const mirrorDistIsSymlink = mirrorDistExists && lstatSync(mirrorDistPath).isSymbolicLink();
+  const mirrorDistTarget = mirrorDistIsSymlink ? readSymlinkTarget(mirrorDistPath) : null;
+  const mirrorDistLinked = mirrorDistIsSymlink && samePath(mirrorDistTarget, expectedMirrorDistTarget);
   const buildOutputExists = existsSync(path.join(sdkPackagePath, 'dist', 'index.mjs'));
 
-  if (!existsSync(linkPath)) {
+  if (!pathEntryExists(linkPath)) {
     return {
       name: `@flopay/${packageName}`,
       linkPath,
       targetPath,
       sdkPackagePath,
+      mirrorPackageJsonExists,
+      mirrorDistPath,
+      mirrorDistTarget,
+      mirrorDistLinked,
       buildOutputExists,
       exists: false,
       isSymlink: false,
       actualTarget: null,
       linked: false,
+      staleMirror: false,
       legacyDirectLinked: false,
     };
   }
@@ -223,17 +250,23 @@ function getPackageLinkStatus(
   const stat = lstatSync(linkPath);
   const isSymlink = stat.isSymbolicLink();
   const actualTarget = isSymlink ? readSymlinkTarget(linkPath) : null;
+  const pointsAtMirror = isSymlink && samePath(actualTarget, targetPath);
 
   return {
     name: `@flopay/${packageName}`,
     linkPath,
     targetPath,
     sdkPackagePath,
+    mirrorPackageJsonExists,
+    mirrorDistPath,
+    mirrorDistTarget,
+    mirrorDistLinked,
     buildOutputExists,
     exists: true,
     isSymlink,
     actualTarget,
-    linked: isSymlink && samePath(actualTarget, targetPath),
+    linked: pointsAtMirror && mirrorPackageJsonExists && mirrorDistLinked,
+    staleMirror: pointsAtMirror && (!mirrorPackageJsonExists || !mirrorDistLinked),
     legacyDirectLinked: isSymlink && samePath(actualTarget, sdkPackagePath),
   };
 }
@@ -276,6 +309,7 @@ export function runDevStatus(workspaceRoot: string): DevStatus {
     getPackageLinkStatus(workspaceRoot, demo.resolvedPath, sdk.resolvedPath, packageName)
   );
   const linkedCount = packages.filter((pkg) => pkg.linked).length;
+  const staleMirrorCount = packages.filter((pkg) => pkg.staleMirror).length;
   const legacyDirectLinkedCount = packages.filter((pkg) => pkg.legacyDirectLinked).length;
   const tools = [
     toolStatus('corepack', 'corepack', ['--version']),
@@ -291,6 +325,7 @@ export function runDevStatus(workspaceRoot: string): DevStatus {
     packages,
     linked: linkedCount === packages.length,
     partiallyLinked: linkedCount > 0 && linkedCount < packages.length,
+    staleMirror: staleMirrorCount > 0,
     legacyDirectLinked: legacyDirectLinkedCount > 0,
     ready: sdk.checkedOut && demo.checkedOut && demo.nodeModules && tools.every((tool) => tool.available),
     recommended: getRecommendedCommands(sdk.resolvedPath, demo.resolvedPath),

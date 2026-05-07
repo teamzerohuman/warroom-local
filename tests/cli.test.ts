@@ -1,6 +1,6 @@
 import { buildProgram } from '../src/cli.js';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import https from 'node:https';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -615,6 +615,36 @@ describe('phase-1 CLI', () => {
     expect(lines.some((line) => line.includes('NODE_OPTIONS=--preserve-symlinks'))).toBe(false);
   });
 
+  it('reports stale SDK-to-demo mirror dist links after a checkout move', async () => {
+    const root = makeDevFixture();
+    const oldSdkPath = path.join(path.dirname(root), 'old-sdk');
+
+    for (const packageName of ['shared', 'js', 'react', 'node']) {
+      const mirrorDistPath = path.join(root, '.warroom', 'dev', 'sdk-packages', packageName, 'dist');
+      rmSync(mirrorDistPath, { recursive: true, force: true });
+      symlinkSync(path.join(oldSdkPath, 'packages', packageName, 'dist'), mirrorDistPath, 'dir');
+    }
+
+    const status = runDevStatus(root);
+
+    expect(status.linked).toBe(false);
+    expect(status.staleMirror).toBe(true);
+    expect(status.packages.map((pkg) => [pkg.name, pkg.staleMirror])).toEqual([
+      ['@flopay/shared', true],
+      ['@flopay/js', true],
+      ['@flopay/react', true],
+      ['@flopay/node', true],
+    ]);
+
+    const lines: string[] = [];
+    const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+    await program.parseAsync(['node', 'warroom', 'dev', 'status']);
+
+    expect(lines.some((line) => line.includes('SDK-to-demo dev link: stale mirror links'))).toBe(true);
+    expect(lines.some((line) => line.includes('stale-mirror @flopay/shared'))).toBe(true);
+  });
+
   it('previews bootstrap without cloning sibling checkouts', () => {
     const root = makeDevFixture();
 
@@ -1180,10 +1210,11 @@ repos:
     const packagePath = path.join(sdk, 'packages', packageName);
     const mirrorPath = path.join(root, '.warroom', 'dev', 'sdk-packages', packageName);
     mkdirSync(path.join(packagePath, 'dist'), { recursive: true });
-    mkdirSync(path.join(mirrorPath, 'dist'), { recursive: true });
+    mkdirSync(mirrorPath, { recursive: true });
     writeFileSync(path.join(packagePath, 'package.json'), `{"name":"@flopay/${packageName}"}\n`);
     writeFileSync(path.join(packagePath, 'dist', 'index.mjs'), '');
     writeFileSync(path.join(mirrorPath, 'package.json'), `{"name":"@flopay/${packageName}"}\n`);
+    symlinkSync(path.join(packagePath, 'dist'), path.join(mirrorPath, 'dist'), 'dir');
     symlinkSync(mirrorPath, path.join(demo, 'node_modules', '@flopay', packageName), 'dir');
   }
 

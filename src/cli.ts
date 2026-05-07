@@ -556,18 +556,25 @@ function printDevStatus(output: Output, result: DevStatus) {
     output(`${tool.name}: ${tool.available ? 'ok' : 'missing'}${tool.detail ? ` (${tool.detail})` : ''}`);
   }
 
-  const linkState = result.linked
-    ? 'linked'
-    : result.partiallyLinked
-      ? 'partially linked'
-      : result.legacyDirectLinked
-        ? 'legacy direct links'
-        : 'unlinked';
+  let linkState = 'unlinked';
+  if (result.linked) {
+    linkState = 'linked';
+  } else if (result.staleMirror) {
+    linkState = 'stale mirror links';
+  } else if (result.partiallyLinked) {
+    linkState = 'partially linked';
+  } else if (result.legacyDirectLinked) {
+    linkState = 'legacy direct links';
+  }
   output(`SDK-to-demo dev link: ${linkState}`);
   for (const packageLink of result.packages) {
     const build = packageLink.buildOutputExists ? 'built' : 'missing dist';
     if (packageLink.linked) {
       output(`ok ${packageLink.name} -> ${packageLink.targetPath} (${build})`);
+    } else if (packageLink.staleMirror) {
+      output(
+        `stale-mirror ${packageLink.name} -> ${packageLink.targetPath} (dist -> ${packageLink.mirrorDistTarget ?? 'missing'}, ${build})`
+      );
     } else if (packageLink.legacyDirectLinked) {
       output(`legacy-direct ${packageLink.name} -> ${packageLink.sdkPackagePath} (${build})`);
     } else if (packageLink.exists) {
