@@ -31,7 +31,7 @@ Workflow commands also understand the Campaign Map:
 
 - `warroom issue next` reads `ready-to-engage` project items first, then can select one for implementation, create the linked development branch, and move it to `battlefield-active`.
 - `warroom issue triage` reads `needs-triage` project items first and can select one interactively to launch a planning-only triage handoff in the Codex TUI. The handoff may post triage notes back to the GitHub issue, but must not implement code. Ally issue repos are resolved through `allies.yaml` when they are not mapped in `repos.yaml`.
-- `warroom issue triage --mark-ready --confirm-status` moves work to `ready-to-engage`.
+- Interactive `warroom issue triage` moves work to `ready-to-engage` and updates workflow labels only after the session exits successfully and War Room verifies a new `## War Room triage notes` issue comment with `Ready for ready-to-engage: yes`. Direct handoffs require `--mark-ready --confirm-status` for the same closeout.
 - `warroom issue next --issue ... --confirm-status` moves work to `battlefield-active`.
 - `warroom pr create --confirm --confirm-status` moves work to `skirmish` after publishing the PR.
 - `warroom pr review --issue ... --confirm-status` moves work to `skirmish`.

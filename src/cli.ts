@@ -275,6 +275,22 @@ function printIssueHandoff(output: Output, result: IssueHandoffResult) {
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
+  if (result.labelUpdate) {
+    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
+    output(
+      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
+    );
+    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
+  }
+  if (result.triageNotes) {
+    const notes = result.triageNotes;
+    output(
+      `Triage notes: ${notes.found ? notes.ready ? 'ready' : 'not ready' : 'missing'}${notes.commentUrl ? ` ${notes.commentUrl}` : ''}`
+    );
+    if (notes.reason) output(`triage notes reason: ${notes.reason}`);
+    if (notes.error) output(`triage notes error: ${notes.error}`);
+  }
+  if (result.closeoutError) output(`triage closeout error: ${result.closeoutError}`);
   output(result.prompt);
   output(issueTriageOutcome(result));
 }
@@ -291,6 +307,12 @@ function issueTriageOutcome(result: IssueHandoffResult) {
   }
 
   if (result.launched) {
+    if (result.closeoutError) {
+      return `Outcome: interactive issue triage session completed, but ready-to-engage closeout was blocked. ${result.closeoutError}`;
+    }
+    if (result.triageNotes && !result.triageNotes.ready) {
+      return `Outcome: interactive issue triage session completed, but Campaign status was not updated. ${result.triageNotes.reason ?? 'Triage notes did not mark the issue ready.'}`;
+    }
     return `Outcome: interactive issue triage session completed.${status}`;
   }
 
@@ -923,15 +945,17 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .action(async (opts: { issue?: string; label?: string; markReady?: boolean; confirmStatus?: boolean; dryRun?: boolean; launch?: boolean; writeArtifact?: boolean; select?: boolean; json?: boolean }) => {
       const triageDryRun = (selectedInteractively: boolean) =>
         opts.dryRun === true ? true : selectedInteractively ? false : !opts.launch;
-      const runTriage = (issueRef?: string, selectedInteractively = false) =>
-        runIssueTriage(workspaceRoot, {
+      const runTriage = (issueRef?: string, selectedInteractively = false) => {
+        const dryRun = triageDryRun(selectedInteractively);
+        return runIssueTriage(workspaceRoot, {
           issue: issueRef,
           label: opts.label,
-          markReady: opts.markReady,
-          confirmStatus: opts.confirmStatus,
-          dryRun: triageDryRun(selectedInteractively),
+          markReady: opts.markReady || selectedInteractively,
+          confirmStatus: dryRun ? false : opts.confirmStatus || selectedInteractively,
+          dryRun,
           writeArtifact: opts.writeArtifact,
         });
+      };
 
       const result = runTriage(opts.issue);
       if (opts.json) {

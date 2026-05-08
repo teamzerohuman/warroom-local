@@ -184,9 +184,42 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('Do not edit repository files, create branches, commit changes, open pull requests'))).toBe(true);
       expect(lines.some((line) => line.includes('Use @grill-me: ask blocking clarification questions one at a time'))).toBe(true);
       expect(lines.some((line) => line.includes('Post the final triage notes back to this GitHub issue'))).toBe(true);
+      expect(lines.some((line) => line.includes('## War Room triage notes'))).toBe(true);
+      expect(lines.some((line) => line.includes('Ready for ready-to-engage: yes'))).toBe(true);
       expect(lines.some((line) => line.includes('Issue body:'))).toBe(true);
       expect(lines.some((line) => line.includes('Clarify how operators should move needs-triage issues toward a ready plan.'))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed.');
+      expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/sdk/issues/4#issuecomment-triage');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage');
+      expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#4 +ready-to-engage; removed needs-triage');
+      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('does not move a triaged issue when no ready triage notes were posted', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexNoTriageNotesFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['1\n']);
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+
+      expect(lines).toContain('Triage notes: missing');
+      expect(lines.some((line) => line.includes('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage'))).toBe(false);
+      expect(lines.some((line) => line.includes('Issue labels: updated TeamFloPay/sdk#4 +ready-to-engage'))).toBe(false);
+      expect(lines.at(-1)).toBe(
+        'Outcome: interactive issue triage session completed, but Campaign status was not updated. No new issue comment containing "## War Room triage notes" was found.'
+      );
     } finally {
       process.env.PATH = originalPath;
     }
@@ -218,7 +251,10 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line === `Adapter: codex --model gpt-5.5 -c model_reasoning_effort="xhigh" --disable fast_mode --sandbox workspace-write -c sandbox_workspace_write.network_access=true --cd ${allyRepo} <prompt> (launched)`)).toBe(true);
       expect(lines.some((line) => line.includes('Ally issue repo context for TeamFloPay/ally-clicktech'))).toBe(true);
       expect(lines.some((line) => line.includes(`Local checkout: ${allyRepo}`))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed.');
+      expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/ally-clicktech/issues/5#issuecomment-triage');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#5 -> ready-to-engage');
+      expect(lines).toContain('Issue labels: updated TeamFloPay/ally-clicktech#5 +ready-to-engage; removed needs-triage');
+      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -2085,6 +2121,9 @@ function writeAllyTriageGhFixture(bin: string) {
     ghPath,
     `#!/usr/bin/env node
 const args = process.argv.slice(2);
+const { existsSync } = require('node:fs');
+const path = require('node:path');
+const triageNotesPath = path.join(path.dirname(process.argv[1]), 'triage-notes-posted');
 
 function json(value) {
   process.stdout.write(JSON.stringify(value));
@@ -2111,12 +2150,64 @@ if (args[0] === 'project' && args[1] === 'item-list') {
 }
 
 if (args[0] === 'issue' && args[1] === 'view') {
+  const comments = existsSync(triageNotesPath)
+    ? [
+        {
+          author: { login: 'andrewslack' },
+          body: [
+            '## War Room triage notes',
+            '',
+            'Ready for ready-to-engage: yes',
+            '',
+            'Owner repo: TeamFloPay/backend',
+            'Acceptance criteria: confirm AVS behavior safely.'
+          ].join('\\n'),
+          createdAt: '2026-05-08T10:00:00Z',
+          url: 'https://github.com/TeamFloPay/ally-clicktech/issues/5#issuecomment-triage'
+        }
+      ]
+    : [];
   json({
     title: 'Possible AVS issue',
     body: 'Check the customer AVS behavior on initial transaction and rebill.',
     url: 'https://github.com/TeamFloPay/ally-clicktech/issues/5',
-    labels: [{ name: 'needs-triage' }, { name: 'ally' }, { name: 'clicktech' }]
+    labels: [{ name: 'needs-triage' }, { name: 'ally' }, { name: 'clicktech' }],
+    comments
   });
+  process.exit(0);
+}
+
+if (args[0] === 'issue' && args[1] === 'edit') {
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'view') {
+  json({ id: 'PVT_campaign', title: 'Campaign Map' });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'field-list') {
+  json({
+    fields: [
+      {
+        id: 'PVTSSF_status',
+        name: 'Status',
+        type: 'ProjectV2SingleSelectField',
+        options: [
+          { id: 'status_needs', name: 'needs-triage' },
+          { id: 'status_ready', name: 'ready-to-engage' },
+          { id: 'status_active', name: 'battlefield-active' },
+          { id: 'status_skirmish', name: 'skirmish' },
+          { id: 'status_blockaded', name: 'blockaded' },
+          { id: 'status_victory', name: 'victory' }
+        ]
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'item-edit') {
   process.exit(0);
 }
 
@@ -2134,6 +2225,9 @@ function writeGhFixture(bin: string) {
     `#!/usr/bin/env node
 const args = process.argv.slice(2);
 const { spawnSync } = require('node:child_process');
+const { existsSync } = require('node:fs');
+const path = require('node:path');
+const triageNotesPath = path.join(path.dirname(process.argv[1]), 'triage-notes-posted');
 
 function json(value) {
   process.stdout.write(JSON.stringify(value));
@@ -2290,11 +2384,29 @@ if (args[0] === 'issue' && args[1] === 'develop') {
 if (args[0] === 'issue' && args[1] === 'view') {
   const issueNumber = args[2];
   if (issueNumber === '4') {
+    const comments = existsSync(triageNotesPath)
+      ? [
+          {
+            author: { login: 'andrewslack' },
+            body: [
+              '## War Room triage notes',
+              '',
+              'Ready for ready-to-engage: yes',
+              '',
+              'Owner repo: TeamFloPay/sdk',
+              'Acceptance criteria: clarify the selector workflow.'
+            ].join('\\n'),
+            createdAt: '2026-05-08T10:00:00Z',
+            url: 'https://github.com/TeamFloPay/sdk/issues/4#issuecomment-triage'
+          }
+        ]
+      : [];
     json({
       title: 'Shape the triage workflow',
       body: 'Clarify how operators should move needs-triage issues toward a ready plan.',
       url: 'https://github.com/TeamFloPay/sdk/issues/4',
-      labels: [{ name: 'needs-triage' }]
+      labels: [{ name: 'needs-triage' }],
+      comments
     });
     process.exit(0);
   }
@@ -2378,6 +2490,10 @@ if (args[0] === 'pr' && args[1] === 'comment') {
 
 if (args[0] === 'issue' && args[1] === 'comment') {
   process.stdout.write('https://github.com/TeamFloPay/backend/issues/562#issuecomment-2');
+  process.exit(0);
+}
+
+if (args[0] === 'issue' && args[1] === 'edit') {
   process.exit(0);
 }
 
@@ -3055,8 +3171,12 @@ function writeCodexFixture(bin: string) {
   writeFileSync(
     codexPath,
     `#!/usr/bin/env node
-if (process.argv[2] !== 'exec') process.exit(0);
 const fs = require('node:fs');
+const path = require('node:path');
+if (process.argv[2] !== 'exec') {
+  fs.writeFileSync(path.join(path.dirname(process.argv[1]), 'triage-notes-posted'), '1');
+  process.exit(0);
+}
 const args = process.argv.slice(2);
 const outputIndex = args.indexOf('-o');
 let input = '';
@@ -3092,6 +3212,17 @@ process.stdin.on('end', () => {
   }
   process.exit(0);
 });
+`
+  );
+  chmodSync(codexPath, 0o755);
+}
+
+function writeCodexNoTriageNotesFixture(bin: string) {
+  const codexPath = path.join(bin, 'codex');
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+process.exit(0);
 `
   );
   chmodSync(codexPath, 0o755);
