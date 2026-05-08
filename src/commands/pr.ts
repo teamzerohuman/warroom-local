@@ -122,6 +122,8 @@ export type MergeReadiness = {
   }>;
   requestedReviewers: string[];
   unresolvedReviewThreads: Array<{
+    threadId?: string;
+    commentId?: string;
     path: string;
     line: number | null;
     author: string;
@@ -558,10 +560,12 @@ fragment PrFields on PullRequest {
 `;
 
 type PullRequestReviewThread = {
+  id?: string;
   isResolved?: boolean;
   isOutdated?: boolean;
   comments?: {
     nodes?: Array<{
+      id?: string;
       path?: string;
       line?: number | null;
       url?: string;
@@ -620,10 +624,12 @@ query($owner: String!, $repo: String!, $number: Int!) {
     pullRequest(number: $number) {
       reviewThreads(first: 100) {
         nodes {
+          id
           isResolved
           isOutdated
-          comments(first: 1) {
+          comments(first: 20) {
             nodes {
+              id
               path
               line
               url
@@ -755,7 +761,7 @@ function ghComment(args: string[]): { url: string | null; error: string | null }
   return { url: result.stdout.trim() || null, error: null };
 }
 
-function listPullRequestReviewThreads(ref: { repo: string; number: number }): MergeReadiness['unresolvedReviewThreads'] {
+function fetchPullRequestReviewThreads(ref: { repo: string; number: number }) {
   const parts = repoParts(ref.repo);
   if (!parts) return [];
 
@@ -775,11 +781,17 @@ function listPullRequestReviewThreads(ref: { repo: string; number: number }): Me
     {}
   );
 
-  return (response.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [])
+  return response.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+}
+
+function listPullRequestReviewThreads(ref: { repo: string; number: number }): MergeReadiness['unresolvedReviewThreads'] {
+  return fetchPullRequestReviewThreads(ref)
     .filter((thread) => thread.isResolved === false)
     .map((thread) => {
       const comment = thread.comments?.nodes?.[0];
       return {
+        threadId: thread.id,
+        commentId: comment?.id,
         path: comment?.path ?? 'unknown',
         line: comment?.line ?? null,
         author: comment?.author?.login ?? 'unknown',
@@ -794,6 +806,34 @@ function listOutstandingCodeRabbitThreads(ref: { repo: string; number: number })
   return listPullRequestReviewThreads(ref).filter(
     (thread) => !thread.isOutdated && thread.author.toLowerCase().includes('coderabbit')
   );
+}
+
+function hasCompletionReply(thread: PullRequestReviewThread) {
+  return (thread.comments?.nodes ?? []).some((comment) => {
+    const author = comment.author?.login?.toLowerCase() ?? '';
+    const body = comment.body?.trim() ?? '';
+    return !author.includes('coderabbit') && /^(Change made|Skipped):/i.test(body);
+  });
+}
+
+function listCodeRabbitThreadsMissingReplies(
+  ref: { repo: string; number: number },
+  expectedThreads: MergeReadiness['unresolvedReviewThreads']
+) {
+  const expectedById = new Map(
+    expectedThreads
+      .filter((thread) => thread.threadId)
+      .map((thread) => [thread.threadId as string, thread])
+  );
+  if (expectedById.size === 0) return [];
+
+  const threadsById = new Map(fetchPullRequestReviewThreads(ref).map((thread) => [thread.id, thread]));
+  return [...expectedById.entries()]
+    .filter(([threadId]) => {
+      const thread = threadsById.get(threadId);
+      return !thread || !hasCompletionReply(thread);
+    })
+    .map(([, thread]) => thread);
 }
 
 function prReviewSnapshot(ref: { repo: string; number: number }): PrReviewSnapshot {
@@ -2942,29 +2982,69 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
   };
 }
 
-function buildCodeRabbitPrReviewPrompt(prUrl: string) {
+function buildCodeRabbitThreadContext(threads: MergeReadiness['unresolvedReviewThreads']) {
+  if (threads.length === 0) {
+    return 'No current unresolved CodeRabbit review threads were visible before launch. Inspect the latest PR review state directly, and if new CodeRabbit feedback appears, handle it with the same reply rules below.';
+  }
+
+  return threads
+    .map((thread, index) => {
+      const line = thread.line === null ? '' : `:${thread.line}`;
+      return [
+        `${index + 1}. ${thread.path}${line}`,
+        `   Thread ID: ${thread.threadId ?? '(not returned by GitHub)'}`,
+        `   Review comment ID: ${thread.commentId ?? '(not returned by GitHub)'}`,
+        `   URL: ${thread.url ?? '(not returned by GitHub)'}`,
+        `   Excerpt: ${thread.excerpt}`,
+      ].join('\n');
+    })
+    .join('\n');
+}
+
+function buildCodeRabbitPrReviewPrompt(
+  prUrl: string,
+  ref: { repo: string; number: number },
+  threads: MergeReadiness['unresolvedReviewThreads']
+) {
   return `Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)
  feedback for the latest commit on the [@github](plugin://github@openai-curated)
  PR ${prUrl}
 
-Please loop over each comment in the latest [@coderabbit](plugin://coderabbit@openai-curated) one by one.
+Repository: ${ref.repo}
+PR number: ${ref.number}
 
-First, add the eyes (👀) emoji to the comment to show you're currently working on the comment.
+Outstanding CodeRabbit review threads captured by War Room:
+${buildCodeRabbitThreadContext(threads)}
 
-Second, review the feedback and grill-me for additional context to complete the work. If a code change is required, please implement an update.
+Please loop over each CodeRabbit review thread one by one.
 
-Finally, once complete, replace the eyes (👀) emoji with the feedback comment:
+As an optional progress marker, add the eyes (👀) reaction to the original review comment when GitHub exposes a review comment ID:
 
--  Change made: reply to the comment about what was changed in the code to address the issue
--  Skipped: with a reply to the comment explaining why it was not valid or no implementation required
+\`gh api -X POST repos/${ref.repo}/pulls/comments/<COMMENT_ID>/reactions -f content=eyes -H "Accept: application/vnd.github+json"\`
 
-Once all comments are complete and you've looped through all outstanding feedback, please commit the code into the PR branch.`;
+If adding the reaction is blocked, cancelled, unsupported, or unauthenticated, skip the reaction and continue. Do not stop before code changes only because the reaction could not be added.
+
+Next, review the feedback and grill-me for additional context to complete the work. If a code change is required, implement the update in the checked-out PR branch.
+
+Finally, you must post one final reply on every listed thread. Do not only commit code and do not rely on CodeRabbit auto-resolving the thread.
+
+Use this thread-reply mutation with each listed Thread ID:
+
+\`gh api graphql -f threadId=<THREAD_ID> -f body='Change made: ...' -f query='mutation($threadId: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) { comment { url } } }'\`
+
+Reply format:
+- Change made: explain the code or test change and include the commit SHA after the commit exists.
+- Skipped: explain why the feedback is not valid or why no implementation is required.
+
+Before finishing, verify every listed Thread ID has a non-CodeRabbit reply starting with either "Change made:" or "Skipped:". If GitHub will not let you reply, stop and report the blocker instead of claiming the review loop is complete.
+
+Once all comments are complete and you've looped through all outstanding feedback, commit the code into the PR branch.`;
 }
 
 async function runCodeRabbitPrReviewLoop(
   workspaceRoot: string,
   ref: { repo: string; number: number },
-  prompt: string,
+  prUrl: string,
   adapterCwd: string,
   initialSnapshot: PrReviewSnapshot,
   options: PrOptions
@@ -2972,6 +3052,7 @@ async function runCodeRabbitPrReviewLoop(
   const config = prReviewLoopConfig();
   const iterations: PrReviewLoopResult['iterations'] = [];
   const blocked: string[] = [];
+  const expectedReplyThreads = new Map<string, MergeReadiness['unresolvedReviewThreads'][number]>();
   let currentHeadSha = initialSnapshot.headRefOid ?? null;
   let adapterCommand: string | null = null;
 
@@ -2986,6 +3067,11 @@ async function runCodeRabbitPrReviewLoop(
   }
 
   for (let index = 1; index <= config.maxLoops; index += 1) {
+    const threadsForPrompt = listOutstandingCodeRabbitThreads(ref);
+    for (const thread of threadsForPrompt) {
+      if (thread.threadId) expectedReplyThreads.set(thread.threadId, thread);
+    }
+    const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, threadsForPrompt);
     options.reviewStatus?.(`PR review loop ${index}: launching adapter for ${ref.repo}#${ref.number}.`);
     const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
     adapterCommand = launch.invocation.display;
@@ -3058,6 +3144,18 @@ async function runCodeRabbitPrReviewLoop(
     }
 
     if (outstanding === 0) {
+      const missingReplies = listCodeRabbitThreadsMissingReplies(ref, [...expectedReplyThreads.values()]);
+      if (missingReplies.length > 0) {
+        const error = `LLM adapter did not post final replies to ${missingReplies.length} CodeRabbit review thread${
+          missingReplies.length === 1 ? '' : 's'
+        }: ${missingReplies.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`;
+        return {
+          loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
+          launched: true,
+          adapterCommand,
+          launchError: error,
+        };
+      }
       options.reviewStatus?.(`PR review loop ${index}: no outstanding CodeRabbit feedback remains.`);
       return {
         loop: { status: 'passed', completed: true, iterations, blocked: [], error: null },
@@ -3086,7 +3184,8 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
   const ref = parsePrRef(options.pr);
   const pr = prReviewSnapshot(ref);
   const prUrl = pr.url ?? `https://github.com/${ref.repo}/pull/${ref.number}`;
-  const prompt = buildCodeRabbitPrReviewPrompt(prUrl);
+  const initialCodeRabbitThreads = listOutstandingCodeRabbitThreads(ref);
+  const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, initialCodeRabbitThreads);
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-review', {
         'prompt.md': prompt,
@@ -3101,6 +3200,7 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
     : null;
   const contextSummary = {
     promptCharacters: prompt.length,
+    comments: initialCodeRabbitThreads.length,
     checks: pr.statusCheckRollup?.length ?? 0,
   };
 
@@ -3118,7 +3218,7 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
     };
   }
 
-  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prompt, adapterCwd, pr, options);
+  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prUrl, adapterCwd, pr, options);
   return {
     prompt,
     artifact,

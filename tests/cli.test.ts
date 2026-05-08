@@ -608,8 +608,64 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review: launched');
       expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines.some((line) => line.includes('Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)'))).toBe(true);
+      expect(lines.some((line) => line.includes('addPullRequestReviewThreadReply'))).toBe(true);
+      expect(lines.some((line) => line.includes('must post one final reply on every listed thread'))).toBe(true);
+      expect(lines.some((line) => line.includes('Do not stop before code changes only because the reaction could not be added.'))).toBe(true);
       expect(lines).toContain('PR review loop iterations: 2');
       expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+    } finally {
+      restorePrReviewEnv();
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('includes visible CodeRabbit thread IDs in the PR review handoff', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writeFileSync(stateFile, '1');
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'multi', outstandingFirst: true });
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review', '--pr', 'TeamFloPay/sdk#12']);
+
+      expect(lines.some((line) => line.includes('Thread ID: PRRT_fixture_1'))).toBe(true);
+      expect(lines.some((line) => line.includes('Review comment ID: PRRC_fixture_1'))).toBe(true);
+      expect(lines.some((line) => line.includes('gh api graphql -f threadId=<THREAD_ID>'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('blocks the PR review loop when CodeRabbit thread replies are missing', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'multi', outstandingFirst: true, replyAfterFix: false });
+    writePrReviewLoopCodexFixture(bin, stateFile);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    const restorePrReviewEnv = setFastPrReviewPolling();
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review', '--pr', 'TeamFloPay/sdk#12', '--launch']);
+
+      expect(lines).toContain('PR review loop: failed');
+      expect(lines.some((line) => line.includes('review loop blocked: LLM adapter did not post final replies to 1 CodeRabbit review thread'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: PR review loop blocked. Resolve the blocker above, then rerun the PR review command.');
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;
@@ -2369,7 +2425,7 @@ process.exit(1);
 function writePrReviewLoopGhFixture(
   bin: string,
   stateFile: string,
-  options: { queue: 'empty' | 'single' | 'multi'; outstandingFirst: boolean; delayedCodeRabbit?: boolean }
+  options: { queue: 'empty' | 'single' | 'multi'; outstandingFirst: boolean; delayedCodeRabbit?: boolean; replyAfterFix?: boolean }
 ) {
   const ghPath = path.join(bin, 'gh');
   writeFileSync(
@@ -2521,6 +2577,23 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   if (query.includes('pullRequest')) {
     const delayedFeedbackPending = options.delayedCodeRabbit && loopCount() === 1 && pollCount() < 4;
     const hasOutstanding = options.outstandingFirst && loopCount() === 1 && !delayedFeedbackPending;
+    const hasResolvedAddressedThread = options.outstandingFirst && loopCount() > 1;
+    const originalCodeRabbitComment = {
+      id: 'PRRC_fixture_1',
+      path: 'src/billing.ts',
+      line: 12,
+      url: 'https://github.com/TeamFloPay/sdk/pull/12#discussion_r1',
+      body: 'CodeRabbit follow-up requested.',
+      author: { login: 'coderabbitai' }
+    };
+    const completionReply = {
+      id: 'PRRC_fixture_reply_1',
+      path: 'src/billing.ts',
+      line: 12,
+      url: 'https://github.com/TeamFloPay/sdk/pull/12#discussion_r1_reply',
+      body: 'Change made: committed the fixture fix.',
+      author: { login: 'andrewslack' }
+    };
     json({
       data: {
         repository: {
@@ -2529,18 +2602,24 @@ if (args[0] === 'api' && args[1] === 'graphql') {
               nodes: hasOutstanding
                 ? [
                     {
+                      id: 'PRRT_fixture_1',
                       isResolved: false,
                       isOutdated: false,
                       comments: {
-                        nodes: [
-                          {
-                            path: 'src/billing.ts',
-                            line: 12,
-                            url: 'https://github.com/TeamFloPay/sdk/pull/12#discussion_r1',
-                            body: 'CodeRabbit follow-up requested.',
-                            author: { login: 'coderabbitai' }
-                          }
-                        ]
+                        nodes: [originalCodeRabbitComment]
+                      }
+                    }
+                  ]
+                : hasResolvedAddressedThread
+                ? [
+                    {
+                      id: 'PRRT_fixture_1',
+                      isResolved: true,
+                      isOutdated: false,
+                      comments: {
+                        nodes: options.replyAfterFix === false
+                          ? [originalCodeRabbitComment]
+                          : [originalCodeRabbitComment, completionReply]
                       }
                     }
                   ]
