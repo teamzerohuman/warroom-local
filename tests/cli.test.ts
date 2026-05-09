@@ -364,7 +364,7 @@ describe('phase-1 CLI', () => {
       const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      const answers = ['yes\n', 'yes\n'];
+      const answers = ['yes\n', 'yes\n', 'no\n'];
       const promptAnswers = setInterval(() => {
         const answer = answers.shift();
         if (answer) input.write(answer);
@@ -395,7 +395,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Triaging TeamFloPay/sdk#123');
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/sdk/issues/123#issuecomment-triage');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#123 -> ready-to-engage');
-      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.');
+      expect(lines.at(-1)).toBe('Run `warroom issue next --issue TeamFloPay/sdk#123` now? [y/N]');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -413,10 +413,21 @@ describe('phase-1 CLI', () => {
 
     try {
       const lines: string[] = [];
-      const input = Readable.from(['1\n']);
+      const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+      const answers = ['1\n', 'n\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
 
       expect(lines).toContain('Issues with Campaign status needs-triage: 1');
       expect(lines.some((line) => line.startsWith('1. TeamFloPay/sdk#4 Shape the triage workflow'))).toBe(true);
@@ -443,7 +454,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/sdk/issues/4#issuecomment-triage');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage');
       expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#4 +ready-to-engage; removed needs-triage');
-      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.');
+      expect(lines.at(-1)).toBe('Run `warroom issue next --issue TeamFloPay/sdk#4` now? [y/N]');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -461,10 +472,21 @@ describe('phase-1 CLI', () => {
 
     try {
       const lines: string[] = [];
-      const input = Readable.from(['yes\n']);
+      const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      await program.parseAsync(['node', 'warroom', 'issue', 'triage', '--issue', 'TeamFloPay/sdk#4']);
+      const answers = ['yes\n', 'yes\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'issue', 'triage', '--issue', 'TeamFloPay/sdk#4']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
 
       expect(lines).toContain(
         'Start issue triage handoff for TeamFloPay/sdk#4 now? This will run `warroom issue triage --issue TeamFloPay/sdk#4 --launch --mark-ready --confirm-status`. [y/N]'
@@ -474,7 +496,11 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('Adapter: codex --model gpt-5.5 ') && line.endsWith(' <prompt> (launched)'))).toBe(true);
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/sdk/issues/4#issuecomment-triage');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage');
-      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.');
+      expect(lines).toContain('Run `warroom issue next --issue TeamFloPay/sdk#4` now? [y/N]');
+      expect(lines).toContain('Starting TeamFloPay/sdk#4');
+      expect(lines).toContain('Issue start: launched');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> battlefield-active');
+      expect(lines.at(-1)).toBe('Run `warroom pr create` next? [y/N]');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -492,10 +518,21 @@ describe('phase-1 CLI', () => {
 
     try {
       const lines: string[] = [];
-      const input = Readable.from(['1\n']);
+      const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+      const answers = ['1\n', 'n\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
 
       expect(lines).toContain('Triage notes: missing');
       expect(lines.some((line) => line.includes('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage'))).toBe(false);
@@ -523,10 +560,21 @@ describe('phase-1 CLI', () => {
 
     try {
       const lines: string[] = [];
-      const input = Readable.from(['1\n']);
+      const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+      const answers = ['1\n', 'n\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
 
       expect(lines).toContain('Issues with Campaign status needs-triage: 1');
       expect(lines.some((line) => line.startsWith('1. TeamFloPay/ally-clicktech#5 Possible AVS issue'))).toBe(true);
@@ -537,7 +585,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/ally-clicktech/issues/5#issuecomment-triage');
       expect(lines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#5 -> ready-to-engage');
       expect(lines).toContain('Issue labels: updated TeamFloPay/ally-clicktech#5 +ready-to-engage; removed needs-triage');
-      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.');
+      expect(lines.at(-1)).toBe('Run `warroom issue next --issue TeamFloPay/ally-clicktech#5` now? [y/N]');
     } finally {
       process.env.PATH = originalPath;
     }

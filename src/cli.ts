@@ -777,6 +777,40 @@ async function promptPrCreateAfterIssueStart(
   }
 }
 
+function triageReadyForIssueNext(result: IssueHandoffResult) {
+  return (
+    result.launched &&
+    !result.launchError &&
+    !result.closeoutError &&
+    result.triageNotes?.ready === true &&
+    result.campaignStatus?.applied === true &&
+    result.campaignStatus.status === 'ready-to-engage'
+  );
+}
+
+async function promptIssueNextAfterTriage(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  issue: string,
+  result: IssueHandoffResult
+) {
+  if (!triageReadyForIssueNext(result)) return;
+
+  const startIssue = await promptConfirmation(output, input, `Run \`warroom issue next --issue ${issue}\` now? [y/N]`);
+  if (!startIssue) return;
+
+  output(`Starting ${issue}`);
+  const plan = runIssueStart(workspaceRoot, {
+    issue,
+    dryRun: false,
+    confirmStatus: true,
+  });
+  printPrPlan(output, plan);
+  if (plan.launchError) process.exitCode = 1;
+  await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan);
+}
+
 function prRefFromCreateResult(result: PrCreateResult) {
   const match = result.url?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
   return match ? `${match[1]}#${match[2]}` : null;
@@ -829,7 +863,10 @@ async function promptIssueTriageAfterCreate(
     dryRun: false,
   });
   if ('issues' in handoff) printIssueList(output, handoff);
-  else printIssueHandoff(output, handoff);
+  else {
+    printIssueHandoff(output, handoff);
+    await promptIssueNextAfterTriage(workspaceRoot, output, input, result.issue, handoff);
+  }
 }
 
 function printAbort(output: Output, result: AbortResult) {
@@ -1264,7 +1301,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             writeArtifact: opts.writeArtifact,
           });
           if ('issues' in launched) printIssueList(output, launched);
-          else printIssueHandoff(output, launched);
+          else {
+            printIssueHandoff(output, launched);
+            await promptIssueNextAfterTriage(workspaceRoot, output, input, opts.issue, launched);
+          }
         }
         return;
       }
@@ -1293,7 +1333,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       output(`Triaging ${issueRef}`);
       const handoff = runTriage(issueRef, true);
       if ('issues' in handoff) printIssueList(output, handoff);
-      else printIssueHandoff(output, handoff);
+      else {
+        printIssueHandoff(output, handoff);
+        await promptIssueNextAfterTriage(workspaceRoot, output, input, issueRef, handoff);
+      }
     });
   issue
     .command('next')
