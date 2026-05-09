@@ -18,8 +18,11 @@ import {
 } from './commands/dev-link.js';
 import { runDoctor } from './commands/doctor.js';
 import {
+  confirmIssueCreate,
+  runIssueCreate,
   runIssueNext,
   runIssueTriage,
+  type IssueCreateResult,
   type IssueHandoffResult,
   type IssueListResult,
   type IssueSummary,
@@ -323,6 +326,69 @@ function issueTriageOutcome(result: IssueHandoffResult) {
   }
 
   return `Outcome: dry run only; no LLM handoff was launched.${status}`;
+}
+
+function issueCreateOutcome(result: IssueCreateResult) {
+  if (result.launchError) {
+    return 'Outcome: issue create session blocked. Resolve the adapter error above, then rerun `warroom issue create`.';
+  }
+  if (result.draftError && !result.created) {
+    return `Outcome: issue not created. ${result.draftError}`;
+  }
+  if (result.created) {
+    const warnings = [
+      result.closeoutError ? `closeout warning: ${result.closeoutError}` : null,
+      result.issueTypeUpdate?.error ? `issue type warning: ${result.issueTypeUpdate.error}` : null,
+    ].filter((warning): warning is string => Boolean(warning));
+    return warnings.length
+      ? `Outcome: issue created with follow-up warnings. ${warnings.join(' ')}`
+      : 'Outcome: issue created and queued for triage.';
+  }
+  if (result.draft) {
+    return 'Outcome: issue draft ready; confirm creation to post it to GitHub.';
+  }
+  return 'Outcome: dry run only; no issue create session was launched.';
+}
+
+function printIssueCreate(output: Output, result: IssueCreateResult) {
+  output(`Issue create: ${result.created ? 'created' : result.draft ? 'draft ready' : result.launched ? 'blocked' : 'dry run'}`);
+  output(`Adapter: ${result.adapterCommand}${result.launched ? ' (launched)' : ' (not launched)'}`);
+  if (result.launchError) output(`Adapter error: ${result.launchError}`);
+  if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
+  if (result.draftPath) output(`Draft file: ${result.draftPath}`);
+  output(`Context size: ${result.contextSummary.promptCharacters} chars`);
+  if (result.draftError) output(`Draft error: ${result.draftError}`);
+  if (result.draft) {
+    output(`Repo: ${result.draft.repo}`);
+    output(`Title: ${result.draft.title}`);
+    output(`Issue type: ${result.draft.issueType ?? 'none'}`);
+    output(`Labels: ${result.draft.labels.length ? result.draft.labels.join(', ') : 'none'}`);
+    if (result.draft.assignees.length) output(`Assignees: ${result.draft.assignees.join(', ')}`);
+    if (result.draft.milestone) output(`Milestone: ${result.draft.milestone}`);
+    if (result.createCommand) output(`Create: ${result.created ? 'created' : 'planned'} ${result.createCommand}`);
+    output(result.draft.body);
+  } else if (!result.launched) {
+    output(result.prompt);
+  }
+  if (result.url) output(`URL: ${result.url}`);
+  if (result.issueTypeUpdate) {
+    output(
+      `Issue type: ${result.issueTypeUpdate.applied ? 'updated' : 'failed'} ${result.issueTypeUpdate.issue} -> ${result.issueTypeUpdate.type}`
+    );
+    if (result.issueTypeUpdate.error) output(`issue type error: ${result.issueTypeUpdate.error}`);
+  }
+  if (result.campaignStatus) {
+    output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
+  }
+  if (result.labelUpdate) {
+    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
+    output(
+      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
+    );
+    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
+  }
+  if (result.closeoutError) output(`issue closeout error: ${result.closeoutError}`);
+  output(issueCreateOutcome(result));
 }
 
 function issueStartOutcome(result: PrPlanResult) {
@@ -738,6 +804,28 @@ async function promptPrReviewAfterPrCreate(
   if (review.launchError) process.exitCode = 1;
 }
 
+async function promptIssueTriageAfterCreate(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  result: IssueCreateResult
+) {
+  if (!result.created || !result.issue) return;
+
+  const triage = await promptConfirmation(output, input, `Run \`warroom issue triage --issue ${result.issue}\` now? [y/N]`);
+  if (!triage) return;
+
+  output(`Triaging ${result.issue}`);
+  const handoff = runIssueTriage(workspaceRoot, {
+    issue: result.issue,
+    markReady: true,
+    confirmStatus: true,
+    dryRun: false,
+  });
+  if ('issues' in handoff) printIssueList(output, handoff);
+  else printIssueHandoff(output, handoff);
+}
+
 function printAbort(output: Output, result: AbortResult) {
   for (const message of result.messages) output(message);
   for (const repo of result.repos) {
@@ -1051,8 +1139,64 @@ export function buildProgram(options: BuildProgramOptions = {}) {
   const issue = program.command('issue').description('Issue workflow commands.');
   issue
     .command('create')
-    .description('Post-MVP feature issue creation flow.')
-    .action(() => output('warroom issue create is deferred from the MVP and tracked in TeamFloPay/infra#7.'));
+    .description('Interactively shape and create a new needs-triage issue.')
+    .option('--repo <owner/repo>', 'Preferred target GitHub repo for the issue draft.')
+    .option('--title <title>', 'Seed title for direct or adapter-assisted issue creation.')
+    .option('--body <body>', 'Seed business context for direct or adapter-assisted issue creation.')
+    .option('--label <label>', 'Additional label to apply. Repeatable.', collect, [])
+    .option('--issue-type <type>', 'GitHub issue type to apply after creation when available.')
+    .option('--confirm', 'Create the drafted issue without asking for the final confirmation.')
+    .option('--dry-run', 'Print the PM session prompt without launching the configured LLM adapter.')
+    .option('--write-artifact', 'Write prompt/input/draft artifacts under .warroom/runs.')
+    .option('--json', 'Print machine-readable output.')
+    .action(
+      async (opts: {
+        repo?: string;
+        title?: string;
+        body?: string;
+        label?: string[];
+        issueType?: string;
+        confirm?: boolean;
+        dryRun?: boolean;
+        writeArtifact?: boolean;
+        json?: boolean;
+      }) => {
+        const directDraft = Boolean(opts.repo && opts.title && opts.body);
+        const dryRun = opts.dryRun === true ? true : directDraft ? false : !interactive;
+        let result = runIssueCreate(workspaceRoot, {
+          repo: opts.repo,
+          title: opts.title,
+          body: opts.body,
+          labels: opts.label,
+          issueType: opts.issueType,
+          confirm: opts.confirm,
+          dryRun,
+          writeArtifact: opts.writeArtifact,
+        });
+        if (opts.json) {
+          printJson(output, result);
+          return;
+        }
+
+        printIssueCreate(output, result);
+        if (result.created) {
+          if (interactive) await promptIssueTriageAfterCreate(workspaceRoot, output, input, result);
+          return;
+        }
+        if (!interactive || opts.confirm || opts.dryRun || !result.draft || result.draftError) return;
+
+        const confirmed = await promptConfirmation(output, input, 'Create this GitHub issue now? [y/N]');
+        if (!confirmed) {
+          output('Issue not created.');
+          output('Outcome: issue not created. Draft remains available for review.');
+          return;
+        }
+
+        result = confirmIssueCreate(workspaceRoot, result);
+        printIssueCreate(output, result);
+        await promptIssueTriageAfterCreate(workspaceRoot, output, input, result);
+      }
+    );
   issue
     .command('fortify')
     .description('Post-MVP quality/refactor issue creation flow.')

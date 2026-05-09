@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
-import { resolveAllyIssueRepo } from '../lib/allies.js';
+import { loadAlliesManifest, resolveAllyIssueRepo, type AllyEntry } from '../lib/allies.js';
 import { CAMPAIGN_LABELS, listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusName, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getInteractiveAdapterInvocation, runInteractiveAdapter } from '../lib/env.js';
 import { ownerRepoFromText } from '../lib/issue-links.js';
@@ -82,6 +83,56 @@ export type IssueNextOptions = {
   label?: string;
   currentPath?: string;
   allRepos?: boolean;
+};
+
+export type IssueCreateDraft = {
+  repo: string;
+  title: string;
+  body: string;
+  labels: string[];
+  issueType: string | null;
+  assignees: string[];
+  milestone: string | null;
+};
+
+export type IssueTypeUpdateResult = {
+  issue: string;
+  type: string;
+  applied: boolean;
+  error: string | null;
+};
+
+export type IssueCreateResult = {
+  prompt: string;
+  artifact: RunArtifact | null;
+  draftPath: string | null;
+  adapterCommand: string;
+  launched: boolean;
+  launchError: string | null;
+  draft: IssueCreateDraft | null;
+  draftError: string | null;
+  created: boolean;
+  issue: string | null;
+  url: string | null;
+  createCommand: string | null;
+  campaignStatus: CampaignStatusSetResult | null;
+  labelUpdate: IssueLabelUpdateResult | null;
+  issueTypeUpdate: IssueTypeUpdateResult | null;
+  closeoutError: string | null;
+  contextSummary: {
+    promptCharacters: number;
+  };
+};
+
+export type IssueCreateOptions = {
+  repo?: string;
+  title?: string;
+  body?: string;
+  labels?: string[];
+  issueType?: string;
+  confirm?: boolean;
+  dryRun?: boolean;
+  writeArtifact?: boolean;
 };
 
 const TRIAGE_NOTES_MARKER = '## War Room triage notes';
@@ -186,6 +237,385 @@ function commentKey(comment: IssueComment) {
 function readinessFromTriageNotes(body: string | undefined) {
   const match = body?.match(/^\s*Ready for ready-to-engage:\s*(yes|no)\s*$/im);
   return match?.[1]?.toLowerCase() ?? null;
+}
+
+function safeTimestamp(date = new Date()) {
+  return date.toISOString().replace(/[:.]/g, '');
+}
+
+function shellQuote(value: string) {
+  return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function repoParts(repo: string) {
+  const [owner, name] = repo.split('/');
+  return owner && name ? { owner, name } : null;
+}
+
+function loadAllies(workspaceRoot: string): AllyEntry[] {
+  try {
+    return loadAlliesManifest(workspaceRoot).allies;
+  } catch {
+    return [];
+  }
+}
+
+function allyForIssueRepo(workspaceRoot: string, githubRepo: string) {
+  return loadAllies(workspaceRoot).find((ally) => ally.issue_repo.github === githubRepo) ?? null;
+}
+
+function knownIssueRepos(workspaceRoot: string) {
+  const mapped = loadRepoManifest(workspaceRoot).repos.map((repo) => ({
+    repo: repo.github,
+    kind: 'mapped product repo',
+    description: repo.description,
+  }));
+  const allies = loadAllies(workspaceRoot).map((ally) => ({
+    repo: ally.issue_repo.github,
+    kind: 'ally issue repo',
+    description: `${ally.name} client-facing issue sync from ${ally.issue_repo.client_system}`,
+  }));
+  return [...mapped, ...allies];
+}
+
+function isKnownIssueRepo(workspaceRoot: string, repo: string) {
+  return knownIssueRepos(workspaceRoot).some((entry) => entry.repo === repo);
+}
+
+function uniqueStrings(values: string[]) {
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    unique.push(trimmed);
+  }
+  return unique;
+}
+
+function stringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((entry): entry is string => typeof entry === 'string');
+  if (typeof value === 'string') return value.split(',').map((entry) => entry.trim());
+  return [];
+}
+
+function normalizeIssueCreateDraft(workspaceRoot: string, raw: unknown): { draft: IssueCreateDraft | null; error: string | null } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { draft: null, error: 'Issue draft JSON must be an object.' };
+  }
+  const record = raw as Record<string, unknown>;
+  const repo = typeof record.repo === 'string' ? record.repo.trim() : '';
+  const title = typeof record.title === 'string' ? record.title.trim().replace(/\s+/g, ' ') : '';
+  const body = typeof record.body === 'string' ? record.body.trim() : '';
+  const issueType =
+    typeof record.issueType === 'string'
+      ? record.issueType.trim()
+      : typeof record.type === 'string'
+        ? record.type.trim()
+        : '';
+  const assignees = uniqueStrings(stringArray(record.assignees));
+  const milestone = typeof record.milestone === 'string' && record.milestone.trim() ? record.milestone.trim() : null;
+
+  if (!repo) return { draft: null, error: 'Issue draft is missing repo.' };
+  if (!isKnownIssueRepo(workspaceRoot, repo)) {
+    return { draft: null, error: `Issue draft repo is not mapped in repos.yaml or allies.yaml: ${repo}.` };
+  }
+  if (!title) return { draft: null, error: 'Issue draft is missing title.' };
+  if (!body) return { draft: null, error: 'Issue draft is missing body.' };
+
+  const workflowLabels = new Set(CAMPAIGN_LABELS.map((label) => label.name));
+  const requestedLabels = stringArray(record.labels).filter((label) => !workflowLabels.has(label));
+  const ally = allyForIssueRepo(workspaceRoot, repo);
+  const labels = uniqueStrings(['needs-triage', ...requestedLabels, ...(ally ? ['ally', ally.id] : [])]);
+
+  return {
+    draft: {
+      repo,
+      title,
+      body,
+      labels,
+      issueType: issueType || null,
+      assignees,
+      milestone,
+    },
+    error: null,
+  };
+}
+
+function parseIssueCreateDraft(workspaceRoot: string, draftPath: string) {
+  if (!existsSync(draftPath)) {
+    return { draft: null, error: `Adapter did not write issue draft JSON to ${draftPath}.` };
+  }
+
+  const raw = readFileSync(draftPath, 'utf8').trim();
+  if (!raw) return { draft: null, error: `Adapter left issue draft JSON empty at ${draftPath}.` };
+
+  try {
+    return normalizeIssueCreateDraft(workspaceRoot, JSON.parse(raw));
+  } catch (error) {
+    return {
+      draft: null,
+      error: `Could not parse issue draft JSON at ${draftPath}: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+function createIssueCreateArtifact(
+  workspaceRoot: string,
+  input: Record<string, unknown>
+): { artifact: RunArtifact; draftPath: string; promptPath: string } {
+  const runDir = path.join(workspaceRoot, '.warroom', 'runs', `${safeTimestamp()}-issue-create`);
+  mkdirSync(runDir, { recursive: true });
+  const inputPath = path.join(runDir, 'input.json');
+  const promptPath = path.join(runDir, 'prompt.md');
+  const draftPath = path.join(runDir, 'issue-draft.json');
+  writeFileSync(inputPath, `${JSON.stringify(input, null, 2)}\n`);
+  writeFileSync(draftPath, '\n');
+  return { artifact: { runDir, files: [inputPath, promptPath, draftPath] }, draftPath, promptPath };
+}
+
+function buildIssueCreatePrompt(workspaceRoot: string, draftPath: string, options: IssueCreateOptions = {}) {
+  const repos = knownIssueRepos(workspaceRoot)
+    .map((entry) => `- ${entry.repo} (${entry.kind}): ${entry.description}`)
+    .join('\n');
+  const seed = [
+    options.repo ? `Preferred repo: ${options.repo}` : null,
+    options.title ? `Seed title: ${options.title}` : null,
+    options.body ? `Seed context:\n${options.body}` : null,
+    options.labels?.length ? `Suggested labels: ${options.labels.join(', ')}` : null,
+    options.issueType ? `Suggested issue type: ${options.issueType}` : null,
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n\n');
+
+  return [
+    'War Room issue creation PM session',
+    '',
+    'Role:',
+    '- Act as a product/project manager gathering enough business context to create a useful GitHub issue.',
+    '- Use @grill-me lightly: ask one blocking business-scope question at a time, then wait for the user answer.',
+    '- Do not perform technical implementation triage; that belongs to `warroom issue triage` after the issue exists.',
+    '- Do not edit code, create branches, commit changes, open pull requests, or mutate GitHub directly.',
+    '- Do not include raw client PII, secrets, private endpoints, tokens, payment details, or sensitive exports in the issue.',
+    '',
+    'Choose the target repo:',
+    '- Use an ally issue repo when the issue is client-facing or the client must keep access to the details.',
+    '- Use a mapped product repo for internal/product-only work that does not need to live in an ally repo.',
+    '- If an ally issue likely needs implementation in a product repo, still create the issue in the ally repo and leave owner-repo selection for technical triage.',
+    '',
+    'Available issue repos:',
+    repos || '- No mapped issue repos found.',
+    '',
+    'Minimum business scope to collect:',
+    '- Who is affected and why this matters.',
+    '- The current observed behavior or opportunity.',
+    '- The desired business outcome.',
+    '- Known constraints, urgency, customer visibility, and useful links.',
+    '- What would make the issue clear enough for technical triage.',
+    '',
+    'Final output contract:',
+    `- Write the final draft JSON to exactly: ${draftPath}`,
+    '- Do not wrap the JSON in Markdown fences.',
+    '- The CLI will preview and create the GitHub issue; do not create it yourself.',
+    '- JSON schema:',
+    '{',
+    '  "repo": "TeamFloPay/<repo>",',
+    '  "title": "Short client-safe issue title",',
+    '  "body": "Markdown body focused on business scope, observed behavior, desired outcome, known links, constraints, and open questions for triage.",',
+    '  "labels": ["optional-domain-or-client-label"],',
+    '  "issueType": "Bug|Task|Feature|...",',
+    '  "assignees": [],',
+    '  "milestone": null',
+    '}',
+    '',
+    'War Room will automatically add the `needs-triage` workflow label, ally labels for ally issue repos, Campaign Map Project 1, and Campaign status `needs-triage`.',
+    seed ? ['', 'Seed context from CLI flags:', seed].join('\n') : '',
+  ]
+    .filter((line, index, lines) => line !== '' || index !== lines.length - 1)
+    .join('\n');
+}
+
+function issueRefFromUrl(url: string | null) {
+  const match = url?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)/);
+  return match ? `${match[1]}#${match[2]}` : null;
+}
+
+function applyIssueType(issue: string, issueType: string | null): IssueTypeUpdateResult | null {
+  if (!issueType) return null;
+  const ref = parseIssueRef(issue);
+  const parts = repoParts(ref.repo);
+  if (!parts) {
+    return { issue, type: issueType, applied: false, error: `Invalid issue repo: ${ref.repo}.` };
+  }
+
+  const lookupQuery = `
+query IssueTypeLookup($owner: String!, $name: String!, $number: Int!, $org: String!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      id
+    }
+  }
+  organization(login: $org) {
+    issueTypes(first: 50) {
+      nodes {
+        id
+        name
+        isEnabled
+      }
+    }
+  }
+}
+`;
+  const lookup = spawnSync(
+    'gh',
+    [
+      'api',
+      'graphql',
+      '-f',
+      `query=${lookupQuery}`,
+      '-f',
+      `owner=${parts.owner}`,
+      '-f',
+      `name=${parts.name}`,
+      '-F',
+      `number=${ref.number}`,
+      '-f',
+      `org=${parts.owner}`,
+    ],
+    { encoding: 'utf8' }
+  );
+  if (lookup.status !== 0) {
+    return {
+      issue,
+      type: issueType,
+      applied: false,
+      error: `${lookup.stderr || lookup.stdout}`.trim() || `gh api graphql failed with exit ${lookup.status ?? 'unknown'}.`,
+    };
+  }
+
+  let parsed: {
+    data?: {
+      repository?: { issue?: { id?: string } | null } | null;
+      organization?: { issueTypes?: { nodes?: Array<{ id?: string; name?: string; isEnabled?: boolean } | null> } | null } | null;
+    };
+  };
+  try {
+    parsed = JSON.parse(lookup.stdout || '{}');
+  } catch {
+    return { issue, type: issueType, applied: false, error: 'Could not parse issue type lookup response.' };
+  }
+
+  const issueId = parsed.data?.repository?.issue?.id;
+  const issueTypes = parsed.data?.organization?.issueTypes?.nodes?.filter((entry): entry is { id?: string; name?: string; isEnabled?: boolean } =>
+    Boolean(entry)
+  ) ?? [];
+  const match = issueTypes.find((entry) => entry.name?.toLowerCase() === issueType.toLowerCase() && entry.isEnabled !== false);
+  if (!issueId) return { issue, type: issueType, applied: false, error: `Could not resolve GitHub node id for ${issue}.` };
+  if (!match?.id) {
+    const available = issueTypes.map((entry) => entry.name).filter(Boolean).join(', ') || 'none';
+    return { issue, type: issueType, applied: false, error: `Issue type "${issueType}" was not found for ${parts.owner}. Available: ${available}.` };
+  }
+
+  const mutation = `
+mutation UpdateIssueType($issueId: ID!, $issueTypeId: ID!) {
+  updateIssueIssueType(input: { issueId: $issueId, issueTypeId: $issueTypeId }) {
+    issue {
+      number
+      issueType {
+        name
+      }
+    }
+  }
+}
+`;
+  const updated = spawnSync(
+    'gh',
+    ['api', 'graphql', '-f', `query=${mutation}`, '-f', `issueId=${issueId}`, '-f', `issueTypeId=${match.id}`],
+    { encoding: 'utf8' }
+  );
+  if (updated.status !== 0) {
+    return {
+      issue,
+      type: issueType,
+      applied: false,
+      error: `${updated.stderr || updated.stdout}`.trim() || `gh api graphql failed with exit ${updated.status ?? 'unknown'}.`,
+    };
+  }
+  return { issue, type: issueType, applied: true, error: null };
+}
+
+function issueCreateCommand(draft: IssueCreateDraft) {
+  const args = [
+    'gh',
+    'issue',
+    'create',
+    '--repo',
+    draft.repo,
+    '--title',
+    draft.title,
+    '--body-file',
+    '-',
+  ];
+  for (const label of draft.labels) args.push('--label', label);
+  for (const assignee of draft.assignees) args.push('--assignee', assignee);
+  if (draft.milestone) args.push('--milestone', draft.milestone);
+  return args.map(shellQuote).join(' ');
+}
+
+function createIssueFromDraft(workspaceRoot: string, result: IssueCreateResult): IssueCreateResult {
+  if (!result.draft) {
+    return { ...result, draftError: result.draftError ?? 'No issue draft is available to create.' };
+  }
+
+  const draft = result.draft;
+  const args = ['issue', 'create', '--repo', draft.repo, '--title', draft.title, '--body-file', '-'];
+  for (const label of draft.labels) args.push('--label', label);
+  for (const assignee of draft.assignees) args.push('--assignee', assignee);
+  if (draft.milestone) args.push('--milestone', draft.milestone);
+  const created = spawnSync('gh', args, { encoding: 'utf8', input: draft.body });
+  const createCommand = issueCreateCommand(draft);
+  if (created.status !== 0) {
+    return {
+      ...result,
+      createCommand,
+      draftError: `${created.stderr || created.stdout}`.trim() || `gh issue create failed with exit ${created.status ?? 'unknown'}.`,
+    };
+  }
+
+  const url = created.stdout.trim().split(/\r?\n/).find((line) => line.includes('/issues/')) ?? created.stdout.trim();
+  const issue = issueRefFromUrl(url);
+  let campaignStatus: CampaignStatusSetResult | null = null;
+  let labelUpdate: IssueLabelUpdateResult | null = null;
+  let issueTypeUpdate: IssueTypeUpdateResult | null = null;
+  const closeoutErrors: string[] = [];
+
+  if (issue) {
+    try {
+      campaignStatus = setCampaignStatus(issue, 'needs-triage', { confirm: true });
+    } catch (error) {
+      closeoutErrors.push(error instanceof Error ? error.message : String(error));
+    }
+
+    labelUpdate = setIssueWorkflowLabel(issue, 'needs-triage', true);
+    if (labelUpdate.error) closeoutErrors.push(labelUpdate.error);
+
+    issueTypeUpdate = applyIssueType(issue, draft.issueType);
+  } else {
+    closeoutErrors.push(`Could not parse created issue URL: ${url || '(empty gh output)'}.`);
+  }
+
+  return {
+    ...result,
+    created: Boolean(issue),
+    issue,
+    url: url || null,
+    createCommand,
+    campaignStatus,
+    labelUpdate,
+    issueTypeUpdate,
+    closeoutError: closeoutErrors.length ? closeoutErrors.join(' ') : null,
+  };
 }
 
 function verifyTriageNotes(ref: IssueRef, before: { comments: IssueComment[]; error: string | null }): TriageNotesResult {
@@ -374,6 +804,96 @@ export function setIssueWorkflowLabel(issue: string, status: CampaignStatusName,
     applied: confirm,
     error: null,
   };
+}
+
+function emptyIssueCreateResult(
+  prompt: string,
+  artifact: RunArtifact | null,
+  draftPath: string | null,
+  adapterCommand: string,
+  launched: boolean,
+  launchError: string | null,
+  draft: IssueCreateDraft | null,
+  draftError: string | null
+): IssueCreateResult {
+  return {
+    prompt,
+    artifact,
+    draftPath,
+    adapterCommand,
+    launched,
+    launchError,
+    draft,
+    draftError,
+    created: false,
+    issue: null,
+    url: null,
+    createCommand: draft ? issueCreateCommand(draft) : null,
+    campaignStatus: null,
+    labelUpdate: null,
+    issueTypeUpdate: null,
+    closeoutError: null,
+    contextSummary: {
+      promptCharacters: prompt.length,
+    },
+  };
+}
+
+export function confirmIssueCreate(workspaceRoot: string, result: IssueCreateResult): IssueCreateResult {
+  return createIssueFromDraft(workspaceRoot, result);
+}
+
+export function runIssueCreate(workspaceRoot: string, options: IssueCreateOptions = {}): IssueCreateResult {
+  const directDraft =
+    options.repo && options.title && options.body
+      ? normalizeIssueCreateDraft(workspaceRoot, {
+          repo: options.repo,
+          title: options.title,
+          body: options.body,
+          labels: options.labels ?? [],
+          issueType: options.issueType ?? null,
+        })
+      : null;
+  const needsAdapter = !directDraft?.draft;
+  const shouldLaunch = needsAdapter && options.dryRun === false;
+  const artifactContext = shouldLaunch || options.writeArtifact ? createIssueCreateArtifact(workspaceRoot, options) : null;
+  const draftPath = artifactContext?.draftPath ?? path.join('<warroom-run>', 'issue-draft.json');
+  const prompt = buildIssueCreatePrompt(workspaceRoot, draftPath, options);
+  if (artifactContext) writeFileSync(artifactContext.promptPath, `${prompt}\n`);
+
+  if (directDraft) {
+    const result = emptyIssueCreateResult(
+      prompt,
+      artifactContext?.artifact ?? null,
+      artifactContext?.draftPath ?? null,
+      getInteractiveAdapterInvocation(workspaceRoot, workspaceRoot).display,
+      false,
+      null,
+      directDraft.draft,
+      directDraft.error
+    );
+    return options.confirm && result.draft ? createIssueFromDraft(workspaceRoot, result) : result;
+  }
+
+  const adapterCommand = getInteractiveAdapterInvocation(workspaceRoot, workspaceRoot).display;
+  if (!shouldLaunch) {
+    return emptyIssueCreateResult(prompt, artifactContext?.artifact ?? null, artifactContext?.draftPath ?? null, adapterCommand, false, null, null, null);
+  }
+
+  const launch = runInteractiveAdapter(workspaceRoot, prompt, { cwd: workspaceRoot });
+  const parsed = launch.launched && artifactContext ? parseIssueCreateDraft(workspaceRoot, artifactContext.draftPath) : { draft: null, error: null };
+  const result = emptyIssueCreateResult(
+    prompt,
+    artifactContext?.artifact ?? null,
+    artifactContext?.draftPath ?? null,
+    launch.invocation.display,
+    launch.launched,
+    launch.error,
+    parsed.draft,
+    parsed.error
+  );
+
+  return options.confirm && result.draft ? createIssueFromDraft(workspaceRoot, result) : result;
 }
 
 export function runIssueTriage(workspaceRoot: string, options: IssueTriageOptions = {}): IssueListResult | IssueHandoffResult {
