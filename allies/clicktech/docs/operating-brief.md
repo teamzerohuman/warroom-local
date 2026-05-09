@@ -11,7 +11,7 @@ ClickTech is an enterprise ally. War Room supports ClickTech work through a loca
 - Issue sync boundary: `TeamFloPay/ally-clicktech`
 - Client system: Jira
 - Sync adapter: Unito
-- Current integration focus: Stripe account/API-key workflows
+- Current integration focus: Stripe account/API-key workflows and LogRocket MCP-assisted debugging
 
 ## Handling Rules
 
@@ -20,3 +20,4 @@ ClickTech is an enterprise ally. War Room supports ClickTech work through a loca
 - Keep raw client exports, production data, private endpoints, contracts, and PII out of git.
 - Reference sensitive external material by approved storage label or safe internal link rather than copying it here.
 - Product source changes remain in the owning child repo, not in the ally workspace.
+- LogRocket MCP access must use the ClickTech-scoped `logrocket-clicktech` server and must not copy raw session data, production data, credentials, or client PII into git.

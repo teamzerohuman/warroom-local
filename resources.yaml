@@ -67,6 +67,12 @@ resources:
     description: Logical Sentry MCP resource for issue/event investigation; credentials stay outside git.
     docs_url: https://docs.sentry.io/
 
+  - id: logrocket-mcp
+    type: mcp
+    name: LogRocket MCP
+    description: Logical LogRocket MCP resource for scoped session, issue, and metric investigation; credentials and client scopes stay outside git.
+    docs_url: https://docs.logrocket.com/docs/mcp
+
   - id: metabase
     type: app
     name: Metabase

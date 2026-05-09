@@ -44,12 +44,14 @@ export type PrOptions = {
   confirmSummary?: boolean;
   cleanupLocal?: boolean;
   confirmCleanup?: boolean;
+  issueComment?: boolean;
   checkInMinutes?: number;
   allowUnresolvedReviewThreads?: boolean;
   issueTitle?: string;
   issueUrl?: string;
   prText?: PrTextResult;
   currentPath?: string;
+  waitForInitialCodeRabbit?: boolean;
   e2eStatus?: (message: string) => void;
   e2eOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void;
   mergeStatus?: (message: string) => void;
@@ -184,6 +186,7 @@ export type PrPlanResult = {
   mergeReadiness?: MergeReadiness;
   summary?: string;
   summaryPosts?: SummaryPostResult[];
+  finalIssueComment?: SummaryPostResult | null;
   merged?: boolean;
   localCleanup?: LocalCleanupResult | null;
   mergeE2E?: MergeE2EResult;
@@ -220,6 +223,7 @@ export type PrCreateResult = {
   campaignStatus: CampaignStatusSetResult | null;
   labelUpdate: IssueLabelUpdateResult | null;
   prText: PrTextResult;
+  issueComment: SummaryPostResult | null;
   artifact?: RunArtifact;
 };
 
@@ -393,6 +397,272 @@ function shellQuote(value: string) {
   return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
 }
 
+type LinkedBranchSetup = {
+  ok: boolean;
+  output: string | null;
+  error: string | null;
+};
+
+type LinkedBranchLookupResponse = {
+  issueRepo?: {
+    issue?: {
+      id?: string;
+      linkedBranches?: {
+        nodes?: Array<{
+          ref?: {
+            name?: string;
+            repository?: {
+              nameWithOwner?: string;
+            } | null;
+          } | null;
+        } | null>;
+      } | null;
+    } | null;
+  } | null;
+  implementationRepo?: {
+    id?: string;
+    ref?: {
+      target?: {
+        oid?: string;
+      } | null;
+    } | null;
+  } | null;
+};
+
+function formatLinkedBranchCommand(ref: IssueRef, implementationRepo: string, branch: string, base: string) {
+  return `gh api graphql createLinkedBranch ${ref.repo}#${ref.number} -> ${implementationRepo}:${branch} from ${base}`;
+}
+
+function linkedBranchLookup(ref: IssueRef, implementationRepo: string, base: string, branch: string) {
+  const issueParts = repoParts(ref.repo);
+  const implementationParts = repoParts(implementationRepo);
+  if (!issueParts || !implementationParts) {
+    return {
+      ok: false,
+      output: null,
+      error: `Invalid repository reference for linked branch: ${ref.repo} -> ${implementationRepo}.`,
+      issueId: null,
+      implementationRepositoryId: null,
+      baseOid: null,
+      alreadyLinked: false,
+    };
+  }
+
+  const query = `
+query LinkedBranchInputs($issueOwner: String!, $issueName: String!, $issueNumber: Int!, $implementationOwner: String!, $implementationName: String!, $baseRef: String!) {
+  issueRepo: repository(owner: $issueOwner, name: $issueName) {
+    issue(number: $issueNumber) {
+      id
+      linkedBranches(first: 50) {
+        nodes {
+          ref {
+            name
+            repository {
+              nameWithOwner
+            }
+          }
+        }
+      }
+    }
+  }
+  implementationRepo: repository(owner: $implementationOwner, name: $implementationName) {
+    id
+    ref(qualifiedName: $baseRef) {
+      target {
+        oid
+      }
+    }
+  }
+}
+`;
+  const result = spawnSync(
+    'gh',
+    [
+      'api',
+      'graphql',
+      '-f',
+      `query=${query}`,
+      '-f',
+      `issueOwner=${issueParts.owner}`,
+      '-f',
+      `issueName=${issueParts.name}`,
+      '-F',
+      `issueNumber=${ref.number}`,
+      '-f',
+      `implementationOwner=${implementationParts.owner}`,
+      '-f',
+      `implementationName=${implementationParts.name}`,
+      '-f',
+      `baseRef=refs/heads/${base}`,
+    ],
+    { encoding: 'utf8' }
+  );
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim() || null;
+  if (result.status !== 0) {
+    return {
+      ok: false,
+      output,
+      error: output || `GitHub linked branch lookup failed with exit ${result.status ?? 'unknown'}.`,
+      issueId: null,
+      implementationRepositoryId: null,
+      baseOid: null,
+      alreadyLinked: false,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout) as { data?: LinkedBranchLookupResponse; errors?: unknown[] };
+    if (parsed.errors?.length) {
+      return {
+        ok: false,
+        output,
+        error: output || 'GitHub linked branch lookup returned GraphQL errors.',
+        issueId: null,
+        implementationRepositoryId: null,
+        baseOid: null,
+        alreadyLinked: false,
+      };
+    }
+
+    const issue = parsed.data?.issueRepo?.issue ?? null;
+    const issueId = issue?.id ?? null;
+    const implementationRepositoryId = parsed.data?.implementationRepo?.id ?? null;
+    const baseOid = parsed.data?.implementationRepo?.ref?.target?.oid ?? null;
+    const alreadyLinked = Boolean(
+      issue?.linkedBranches?.nodes?.some((node) => node?.ref?.name === branch && node?.ref?.repository?.nameWithOwner === implementationRepo)
+    );
+    if (!issueId || !implementationRepositoryId || !baseOid) {
+      return {
+        ok: false,
+        output,
+        error: `Could not resolve linked branch inputs for ${ref.repo}#${ref.number} -> ${implementationRepo}:${base}.`,
+        issueId,
+        implementationRepositoryId,
+        baseOid,
+        alreadyLinked,
+      };
+    }
+
+    return { ok: true, output, error: null, issueId, implementationRepositoryId, baseOid, alreadyLinked };
+  } catch (error) {
+    return {
+      ok: false,
+      output,
+      error: `Could not parse GitHub linked branch lookup response: ${error instanceof Error ? error.message : String(error)}`,
+      issueId: null,
+      implementationRepositoryId: null,
+      baseOid: null,
+      alreadyLinked: false,
+    };
+  }
+}
+
+function createGitHubLinkedBranch(ref: IssueRef, implementationRepo: string, branch: string, base: string): LinkedBranchSetup {
+  const lookup = linkedBranchLookup(ref, implementationRepo, base, branch);
+  if (!lookup.ok || !lookup.issueId || !lookup.implementationRepositoryId || !lookup.baseOid) {
+    return { ok: false, output: lookup.output, error: lookup.error };
+  }
+  if (lookup.alreadyLinked) return { ok: true, output: lookup.output, error: null };
+
+  const mutation = `
+mutation CreateLinkedBranch($issueId: ID!, $repositoryId: ID!, $name: String!, $oid: GitObjectID!) {
+  createLinkedBranch(input: { issueId: $issueId, repositoryId: $repositoryId, name: $name, oid: $oid }) {
+    issue {
+      number
+    }
+    linkedBranch {
+      id
+    }
+  }
+}
+`;
+  const result = spawnSync(
+    'gh',
+    [
+      'api',
+      'graphql',
+      '-f',
+      `query=${mutation}`,
+      '-f',
+      `issueId=${lookup.issueId}`,
+      '-f',
+      `repositoryId=${lookup.implementationRepositoryId}`,
+      '-f',
+      `name=${branch}`,
+      '-f',
+      `oid=${lookup.baseOid}`,
+    ],
+    { encoding: 'utf8' }
+  );
+  const output = [lookup.output, `${result.stdout ?? ''}${result.stderr ?? ''}`.trim()].filter(Boolean).join('\n') || null;
+  if (result.status !== 0) {
+    return {
+      ok: false,
+      output,
+      error: output || `GitHub linked branch creation failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout) as { errors?: unknown[] };
+    if (parsed.errors?.length) {
+      return {
+        ok: false,
+        output,
+        error: output || 'GitHub linked branch creation returned GraphQL errors.',
+      };
+    }
+  } catch {
+    return { ok: false, output, error: 'Could not parse GitHub linked branch creation response.' };
+  }
+
+  return { ok: true, output, error: null };
+}
+
+function checkoutLinkedBranch(repoPath: string, branch: string) {
+  const fetch = runGit(repoPath, ['fetch', 'origin', branch]);
+  const branchExistsLocally = branchExists(repoPath, branch);
+  const checkout = branchExistsLocally
+    ? runGit(repoPath, ['switch', branch])
+    : runGit(repoPath, ['switch', '-c', branch, '--track', `origin/${branch}`]);
+  const upstream = checkout.status === 0 ? runGit(repoPath, ['branch', '--set-upstream-to', `origin/${branch}`, branch]) : null;
+  const output =
+    [
+      fetch.stdout,
+      fetch.stderr,
+      checkout.stdout,
+      checkout.stderr,
+      upstream?.stdout,
+      upstream?.stderr,
+    ]
+      .filter(Boolean)
+      .join('\n') || null;
+
+  if (fetch.status !== 0) {
+    return {
+      ok: false,
+      output,
+      error: output || `Development branch fetch failed with exit ${fetch.status ?? 'unknown'}.`,
+    };
+  }
+  if (checkout.status !== 0) {
+    return {
+      ok: false,
+      output,
+      error: output || `Development branch checkout failed with exit ${checkout.status ?? 'unknown'}.`,
+    };
+  }
+  if (upstream && upstream.status !== 0) {
+    return {
+      ok: false,
+      output,
+      error: output || `Development branch upstream setup failed with exit ${upstream.status ?? 'unknown'}.`,
+    };
+  }
+
+  return { ok: true, output, error: null };
+}
+
 function createDevelopmentBranchResult(
   workspaceRoot: string,
   ref: IssueRef,
@@ -419,9 +689,7 @@ function createDevelopmentBranchResult(
         branch,
       ];
   if (!crossRepo && checkoutRequired) commandArgs.push('--checkout');
-  const command = crossRepo
-    ? `git fetch origin ${shellQuote(base)} && git switch -c ${shellQuote(branch)} origin/${shellQuote(base)}`
-    : ['gh', ...commandArgs].join(' ');
+  const command = crossRepo ? formatLinkedBranchCommand(ref, implementationRepo, branch, base) : ['gh', ...commandArgs].join(' ');
   const blocked: string[] = [];
 
   if (!repoEntry) {
@@ -452,47 +720,25 @@ function createDevelopmentBranchResult(
   }
 
   if (crossRepo) {
-    let output: string | null = null;
-    if (branchExists(repo.resolvedPath, branch)) {
-      const switched = runGit(repo.resolvedPath, ['switch', branch]);
-      output = `${switched.stdout ?? ''}${switched.stderr ?? ''}`.trim() || null;
-      if (switched.status !== 0) {
-        return {
-          repo: implementationRepo,
-          path: repo.resolvedPath,
-          branch,
-          base,
-          command,
-          checkoutRequired,
-          applied: false,
-          linked: false,
-          checkedOut: false,
-          blocked: [`Development branch checkout failed with exit ${switched.status ?? 'unknown'}.`],
-          output,
-          error: output || `Development branch checkout failed with exit ${switched.status ?? 'unknown'}.`,
-        };
-      }
-    } else {
-      const fetch = runGit(repo.resolvedPath, ['fetch', 'origin', base]);
-      const startPoint = fetch.status === 0 ? `origin/${base}` : base;
-      const created = runGit(repo.resolvedPath, ['switch', '-c', branch, startPoint]);
-      output = `${fetch.stdout ?? ''}${fetch.stderr ?? ''}${created.stdout ?? ''}${created.stderr ?? ''}`.trim() || null;
-      if (created.status !== 0) {
-        return {
-          repo: implementationRepo,
-          path: repo.resolvedPath,
-          branch,
-          base,
-          command,
-          checkoutRequired,
-          applied: false,
-          linked: false,
-          checkedOut: false,
-          blocked: [`Development branch setup failed with exit ${created.status ?? 'unknown'}.`],
-          output,
-          error: output || `Development branch setup failed with exit ${created.status ?? 'unknown'}.`,
-        };
-      }
+    const linkedBranch = createGitHubLinkedBranch(ref, implementationRepo, branch, base);
+    const checkout = linkedBranch.ok ? checkoutLinkedBranch(repo.resolvedPath, branch) : null;
+    let output = [linkedBranch.output, checkout?.output].filter(Boolean).join('\n') || null;
+    if (!linkedBranch.ok || !checkout?.ok) {
+      const error = linkedBranch.error ?? checkout?.error ?? 'Development linked branch setup failed.';
+      return {
+        repo: implementationRepo,
+        path: repo.resolvedPath,
+        branch,
+        base,
+        command,
+        checkoutRequired,
+        applied: false,
+        linked: linkedBranch.ok,
+        checkedOut: false,
+        blocked: [error],
+        output,
+        error,
+      };
     }
 
     const issueMetadata = runGit(repo.resolvedPath, ['config', `branch.${branch}.warroom-issue`, `${ref.repo}#${ref.number}`]);
@@ -534,7 +780,7 @@ function createDevelopmentBranchResult(
       command,
       checkoutRequired,
       applied: true,
-      linked: false,
+      linked: true,
       checkedOut,
       blocked: !checkoutRequired || checkedOut ? [] : [`Created development branch, but local checkout is on ${currentBranch?.stdout || 'unknown'}.`],
       output,
@@ -1803,6 +2049,9 @@ function prCreateMarkdown(result: Omit<PrCreateResult, 'artifact'>) {
     `- Created: ${result.created ? 'yes' : 'no'}`,
     result.url ? `- URL: ${result.url}` : null,
     result.pushCommand ? `- Push: ${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}` : '- Push: skipped',
+    result.issueComment
+      ? `- Issue comment: ${result.issueComment.applied ? `posted ${result.issueComment.url ?? ''}` : result.issueComment.reason ?? result.issueComment.error ?? 'not posted'}`
+      : null,
     '',
     '## Blockers',
     result.blocked.length ? result.blocked.map((blocker) => `- ${blocker}`).join('\n') : 'No blockers.',
@@ -1810,6 +2059,62 @@ function prCreateMarkdown(result: Omit<PrCreateResult, 'artifact'>) {
     '## Body',
     result.body,
   ].filter((line): line is string => line !== null).join('\n');
+}
+
+function buildPrCreateIssueCommentBody(result: Omit<PrCreateResult, 'artifact' | 'issueComment'>) {
+  return [
+    '## War Room PR opened',
+    '',
+    `PR: ${result.url ?? 'not created yet'}`,
+    `Repo: ${result.repo}`,
+    `Branch: ${result.branch} -> ${result.base}`,
+    `Title: ${result.title}`,
+    `PR text: ${result.prText.source === 'adapter' ? 'generated by LLM adapter' : result.prText.source === 'manual' ? 'supplied by flags' : 'local fallback'}`,
+    '',
+    'PR description:',
+    '',
+    result.body,
+  ].join('\n');
+}
+
+function buildPrCreateIssueCommentResult(
+  issue: string | null,
+  created: boolean,
+  issueCommentEnabled: boolean | undefined,
+  body: string | null
+): SummaryPostResult | null {
+  if (!issue) return null;
+  if (issueCommentEnabled === false) {
+    return {
+      target: 'issue',
+      ref: issue,
+      applied: false,
+      url: null,
+      reason: 'Issue progress comments disabled by --no-issue-comment.',
+      error: null,
+    };
+  }
+  if (!created || !body) {
+    return {
+      target: 'issue',
+      ref: issue,
+      applied: false,
+      url: null,
+      reason: 'PR not created yet.',
+      error: null,
+    };
+  }
+
+  const ref = parseIssueRef(issue);
+  const result = ghComment(['issue', 'comment', String(ref.number), '--repo', ref.repo, '--body', body]);
+  return {
+    target: 'issue',
+    ref: issue,
+    applied: result.error === null,
+    url: result.url,
+    reason: null,
+    error: result.error,
+  };
 }
 
 export function inferPrRefForCurrentBranch(workspaceRoot: string, currentPath: string) {
@@ -1975,7 +2280,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
   const labelUpdate = issueRef
     ? setIssueWorkflowLabel(issueRef, 'skirmish', Boolean(options.confirm && options.confirmStatus && created))
     : null;
-  const result: Omit<PrCreateResult, 'artifact'> = {
+  const baseResult: Omit<PrCreateResult, 'artifact' | 'issueComment'> = {
     action: 'create',
     repo: repo.github,
     path: repo.resolvedPath,
@@ -1995,6 +2300,16 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     labelUpdate,
     prText,
   };
+  const issueComment = buildPrCreateIssueCommentResult(
+    issueRef,
+    created,
+    options.issueComment,
+    buildPrCreateIssueCommentBody(baseResult)
+  );
+  const result: Omit<PrCreateResult, 'artifact'> = {
+    ...baseResult,
+    issueComment,
+  };
 
   if (!options.writeArtifact) return result;
 
@@ -2005,6 +2320,8 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
       'result.json': JSON.stringify(result, null, 2),
       'summary.md': prCreateMarkdown(result),
       'body.md': body,
+      ...(issueComment ? { 'issue-comment.json': JSON.stringify(issueComment, null, 2) } : {}),
+      ...(issueComment ? { 'issue-comment.md': buildPrCreateIssueCommentBody(baseResult) } : {}),
     }),
   };
 }
@@ -2921,6 +3238,81 @@ function buildSummaryPostPlan(options: PrOptions, summary: string, readiness: Me
   });
 }
 
+function buildFinalVictoryComment(
+  prRef: string,
+  pr: { title?: string; url?: string; headRefName?: string; baseRefName?: string },
+  mergeE2E: MergeE2EResult,
+  mergeChangelog: MergeChangelogResult
+) {
+  return [
+    '## War Room victory update',
+    '',
+    `PR merged: ${pr.url ?? `https://github.com/${prRef.replace('#', '/pull/')}`}`,
+    `Title: ${pr.title ?? 'unknown'}`,
+    `Branch: ${pr.headRefName ?? 'unknown'} -> ${pr.baseRefName ?? 'unknown'}`,
+    '',
+    'Outcome: the implementation PR has merged and this issue is ready for victory closeout.',
+    '',
+    'Final checks:',
+    `- Merge gate: passed`,
+    `- Demo e2e: ${mergeE2E.status}${mergeE2E.skipReason ? ` (${mergeE2E.skipReason})` : ''}`,
+    `- Changelog: ${mergeChangelog.status}${mergeChangelog.skipReason ? ` (${mergeChangelog.skipReason})` : ''}`,
+  ].join('\n');
+}
+
+function buildFinalIssueCommentPlan(
+  issueRef: string | null,
+  prRef: string,
+  pr: { title?: string; url?: string; headRefName?: string; baseRefName?: string },
+  merged: boolean,
+  readiness: MergeReadiness,
+  mergeE2E: MergeE2EResult,
+  mergeChangelog: MergeChangelogResult,
+  issueCommentEnabled: boolean | undefined
+): SummaryPostResult | null {
+  if (!issueRef) return null;
+  if (issueCommentEnabled === false) {
+    return {
+      target: 'issue',
+      ref: issueRef,
+      applied: false,
+      url: null,
+      reason: 'Issue progress comments disabled by --no-issue-comment.',
+      error: null,
+    };
+  }
+  if (!merged) return null;
+  if (readiness.blocked.length > 0) {
+    return {
+      target: 'issue',
+      ref: issueRef,
+      applied: false,
+      url: null,
+      reason: 'Merge readiness blockers are present.',
+      error: null,
+    };
+  }
+
+  const ref = parseIssueRef(issueRef);
+  const result = ghComment([
+    'issue',
+    'comment',
+    String(ref.number),
+    '--repo',
+    ref.repo,
+    '--body',
+    buildFinalVictoryComment(prRef, pr, mergeE2E, mergeChangelog),
+  ]);
+  return {
+    target: 'issue',
+    ref: issueRef,
+    applied: result.error === null,
+    url: result.url,
+    reason: null,
+    error: result.error,
+  };
+}
+
 function planLocalCleanup(
   workspaceRoot: string,
   prRepo: string,
@@ -3054,7 +3446,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     `Base branch: ${base} (use stage only as the second target option after validation)`,
     `Feature branch: ${featureBranch}`,
     crossRepoImplementation
-      ? `Development branch setup: ${developmentBranch.applied ? 'created' : 'planned'} in ${implementationRepo} with \`${developmentBranch.command}\``
+      ? `Development branch link: ${developmentBranch.applied ? 'created' : 'planned'} in ${implementationRepo} with \`${developmentBranch.command}\``
       : `Development branch link: ${developmentBranch.applied ? 'created' : 'planned'} with \`${developmentBranch.command}\``,
     '',
     buildSpecialistContext(workspaceRoot, implementationRepo),
@@ -3243,6 +3635,44 @@ async function runCodeRabbitPrReviewLoop(
       adapterCommand,
       launchError: blocked.join(' '),
     };
+  }
+
+  if (options.waitForInitialCodeRabbit) {
+    options.reviewStatus?.(`PR review loop: waiting for CodeRabbit feedback on the initial PR commit ${shortSha(currentHeadSha)}.`);
+    const feedback = await waitForCodeRabbitFeedback(
+      ref,
+      currentHeadSha,
+      config.codeRabbitTimeoutMs,
+      config.codeRabbitSettleMs,
+      config.pollMs
+    );
+    if (!feedback.ready) {
+      const error = `CodeRabbit feedback did not settle on the initial PR commit ${shortSha(currentHeadSha)} within ${
+        config.codeRabbitTimeoutMs
+      }ms: ${feedback.reason ?? 'unknown wait state'}`;
+      return {
+        loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
+        launched: false,
+        adapterCommand,
+        launchError: error,
+      };
+    }
+
+    if (feedback.threads.length === 0) {
+      options.reviewStatus?.('PR review loop: no outstanding CodeRabbit feedback remains on the initial PR commit.');
+      return {
+        loop: { status: 'passed', completed: true, iterations, blocked: [], error: null },
+        launched: false,
+        adapterCommand,
+        launchError: null,
+      };
+    }
+
+    options.reviewStatus?.(
+      `PR review loop: ${feedback.threads.length} outstanding CodeRabbit comment${
+        feedback.threads.length === 1 ? ' is' : 's are'
+      } ready on the initial PR commit.`
+    );
   }
 
   for (let index = 1; index <= config.maxLoops; index += 1) {
@@ -3565,6 +3995,16 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
       ? { ...readiness, blocked: [...readiness.blocked, 'Required CHANGELOG.md update failed.'] }
       : readiness;
   const summaryPosts = buildSummaryPostPlan(resolvedOptions, summary, completionReadiness);
+  const finalIssueComment = buildFinalIssueCommentPlan(
+    issueRef ?? null,
+    options.pr,
+    pr,
+    merged,
+    completionReadiness,
+    mergeE2E,
+    mergeChangelog,
+    options.issueComment
+  );
   const localCleanup = planLocalCleanup(workspaceRoot, ref.repo, pr.headRefName, pr.baseRefName, options);
   const campaignStatus = issueRef
     ? setCampaignStatus(issueRef, 'victory', { confirm: options.confirmStatus && completionReadiness.blocked.length === 0 })
@@ -3582,6 +4022,10 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
         'merge-changelog.json': JSON.stringify(mergeChangelog, null, 2),
         'summary.md': summary,
         'summary-posts.json': JSON.stringify(summaryPosts, null, 2),
+        ...(finalIssueComment ? { 'final-issue-comment.json': JSON.stringify(finalIssueComment, null, 2) } : {}),
+        ...(finalIssueComment
+          ? { 'final-issue-comment.md': buildFinalVictoryComment(options.pr, pr, mergeE2E, mergeChangelog) }
+          : {}),
         'local-cleanup.json': JSON.stringify(localCleanup, null, 2),
       })
     : null;
@@ -3600,6 +4044,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     mergeChangelog,
     summary,
     summaryPosts,
+    finalIssueComment,
     merged,
     localCleanup,
     contextSummary: { promptCharacters: prompt.length, checks: readiness.checks.length },

@@ -10,11 +10,13 @@ allies/clicktech/
   .env.local.example
   .env.local
   docs/
+  scripts/
   repos/
   workspace/
 ```
 
 - `README.md` and `docs/*` are committed shared context for the Flo team.
+- `scripts/*` are committed local helpers for ClickTech-specific tool setup.
 - `.env.local.example` is a committed template with safe placeholders only.
 - `.env.local` is ignored and holds ClickTech-specific local secrets such as Stripe keys.
 - `repos/*` is ignored and reserved for client issue repo checkouts such as `TeamFloPay/ally-clicktech`.
@@ -45,6 +47,18 @@ STRIPE_ACCOUNT_SAFE_ALIAS_SECRET_KEY=
 ```
 
 Do not commit real keys, account IDs, private endpoints, exports, production data, or client PII.
+
+## LogRocket MCP
+
+ClickTech LogRocket MCP setup is documented in `docs/logrocket-mcp.md`.
+
+Use the local helper after adding a ClickTech-scoped LogRocket org/project to `.env.local`:
+
+```sh
+scripts/setup-logrocket-mcp.sh
+```
+
+This configures the MCP server name `logrocket-clicktech` for Codex and Claude Code when those CLIs are installed. The helper refuses the unscoped LogRocket MCP base URL.
 
 ## Issue Tracking
 

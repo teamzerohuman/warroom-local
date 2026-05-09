@@ -5,10 +5,12 @@ import { getRepoById, getRepoHealth, loadRepoManifest, runGit, type RepoHealth }
 
 export type CommitCreateOptions = {
   repo?: string;
+  issue?: string;
   message?: string;
   confirm?: boolean;
   all?: boolean;
   push?: boolean;
+  issueComment?: boolean;
   validate?: string[];
   writeArtifact?: boolean;
   currentPath?: string;
@@ -33,10 +35,12 @@ export type CommitValidationResult = {
 
 export type CommitCreateResult = {
   repo: string;
+  githubRepo: string;
   path: string;
   branch: string | null;
   headSha: string | null;
   upstream: string | null;
+  issue: string | null;
   clean: boolean | null;
   statusLines: string[];
   changes: CommitFileChange[];
@@ -47,8 +51,17 @@ export type CommitCreateResult = {
   pushed: boolean;
   pushCommand: string | null;
   pushSkippedReason: string | null;
+  issueComment: IssueProgressCommentResult | null;
   blocked: string[];
   artifact?: RunArtifact;
+};
+
+export type IssueProgressCommentResult = {
+  issue: string;
+  applied: boolean;
+  url: string | null;
+  reason: string | null;
+  error: string | null;
 };
 
 type PushPlan = {
@@ -131,6 +144,21 @@ function gitConfig(repoPath: string, key: string) {
   return result.status === 0 && result.stdout ? result.stdout : null;
 }
 
+function configuredBranchIssueRef(repoPath: string, branch: string | null) {
+  if (!branch) return null;
+  const configured = gitConfig(repoPath, `branch.${branch}.warroom-issue`);
+  if (configured?.match(/^[^#]+#\d+$/)) return configured;
+  return null;
+}
+
+function currentBranchIssueRef(repo: string, branch: string | null, repoPath: string) {
+  const configured = configuredBranchIssueRef(repoPath, branch);
+  if (configured) return configured;
+
+  const match = branch?.match(/^warroom\/(\d+)-/);
+  return match ? `${repo}#${match[1]}` : null;
+}
+
 function branchHasWarRoomMetadata(repo: RepoHealth) {
   if (!repo.checkedOut || !repo.branch) return false;
   return Boolean(
@@ -183,6 +211,12 @@ function hasOriginRemote(repoPath: string) {
   return result.status === 0 && result.stdout.trim().length > 0;
 }
 
+function upstreamMatchesCurrentBranch(repo: RepoHealth) {
+  if (!repo.branch || !repo.upstream) return false;
+  const remoteBranch = repo.upstream.replace(/^[^/]+\//, '');
+  return remoteBranch === repo.branch;
+}
+
 function buildPushPlan(repo: RepoHealth, shouldPush: boolean): PushPlan {
   if (!shouldPush) {
     return {
@@ -202,7 +236,7 @@ function buildPushPlan(repo: RepoHealth, shouldPush: boolean): PushPlan {
     };
   }
 
-  if (repo.upstream) {
+  if (repo.upstream && upstreamMatchesCurrentBranch(repo)) {
     return {
       args: ['push'],
       command: 'git push',
@@ -224,7 +258,9 @@ function buildPushPlan(repo: RepoHealth, shouldPush: boolean): PushPlan {
     return {
       args: null,
       command: null,
-      blocker: 'Repo has no upstream and no origin remote for push.',
+      blocker: repo.upstream
+        ? `Repo upstream ${repo.upstream} does not match branch ${repo.branch}, and no origin remote is configured for push.`
+        : 'Repo has no upstream and no origin remote for push.',
       skippedReason: null,
     };
   }
@@ -245,6 +281,7 @@ function markdownSummary(result: Omit<CommitCreateResult, 'artifact'>) {
     `- Branch: ${result.branch ?? 'unknown'}`,
     `- Head: ${result.headSha ?? 'unknown'}`,
     `- Upstream: ${result.upstream ?? 'none'}`,
+    `- Issue: ${result.issue ?? 'none inferred'}`,
     `- Suggested message: ${result.suggestedMessage}`,
     `- Committed: ${result.committed ? 'yes' : 'no'}`,
     `- Push: ${result.pushSkippedReason ? `skipped (${result.pushSkippedReason})` : result.pushCommand ? `${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}` : 'none'}`,
@@ -281,6 +318,95 @@ function markdownSummary(result: Omit<CommitCreateResult, 'artifact'>) {
   return lines.join('\n');
 }
 
+function issueRefParts(issue: string) {
+  const match = issue.match(/^([^#]+)#(\d+)$/);
+  if (!match) return null;
+  return { repo: match[1]!, number: match[2]! };
+}
+
+function postIssueProgressComment(issue: string, body: string): IssueProgressCommentResult {
+  const ref = issueRefParts(issue);
+  if (!ref) {
+    return {
+      issue,
+      applied: false,
+      url: null,
+      reason: null,
+      error: `Invalid issue reference ${issue}. Expected owner/repo#number.`,
+    };
+  }
+
+  const result = spawnSync('gh', ['issue', 'comment', ref.number, '--repo', ref.repo, '--body', body], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return {
+      issue,
+      applied: false,
+      url: null,
+      reason: null,
+      error: result.stderr.trim() || `gh issue comment failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+
+  return {
+    issue,
+    applied: true,
+    url: result.stdout.trim() || null,
+    reason: null,
+    error: null,
+  };
+}
+
+function commitIssueCommentBody(result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>) {
+  const lines = [
+    '## War Room commit update',
+    '',
+    `Repo: ${result.githubRepo}`,
+    `Branch: ${result.branch ?? 'unknown'}`,
+    result.committedSha ? `Commit: ${result.committedSha}` : null,
+    `Title: ${result.suggestedMessage}`,
+    `Pushed: ${result.pushed ? 'yes' : result.pushSkippedReason ? `no (${result.pushSkippedReason})` : 'no'}`,
+    '',
+    'Changed files:',
+  ].filter((line): line is string => line !== null);
+
+  if (result.changes.length === 0) {
+    lines.push('- none');
+  } else {
+    for (const change of result.changes) {
+      const state = change.staged && change.unstaged ? 'staged+unstaged' : change.staged ? 'staged' : 'unstaged';
+      lines.push(`- ${change.indexStatus}${change.worktreeStatus} ${change.path} (${state})`);
+    }
+  }
+
+  lines.push('', 'Validation:');
+  if (result.validation.length === 0) {
+    lines.push('- not run by `warroom commit create`');
+  } else {
+    for (const validation of result.validation) {
+      lines.push(`- ${validation.ok ? 'passed' : 'failed'}: ${validation.command} (exit ${validation.status ?? 'unknown'})`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function buildIssueCommentResult(
+  issue: string | null,
+  confirm: boolean | undefined,
+  issueCommentEnabled: boolean | undefined,
+  committed: boolean,
+  body: string | null
+) {
+  if (!issue) return null;
+  if (issueCommentEnabled === false) {
+    return { issue, applied: false, url: null, reason: 'Issue progress comments disabled by --no-issue-comment.', error: null };
+  }
+  if (!confirm || !committed || !body) {
+    return { issue, applied: false, url: null, reason: 'Commit not created yet.', error: null };
+  }
+  return postIssueProgressComment(issue, body);
+}
+
 export function runCommitCreate(workspaceRoot: string, options: CommitCreateOptions = {}): CommitCreateResult {
   const manifest = loadRepoManifest(workspaceRoot);
   const repoHealth = manifest.repos.map((entry) => getRepoHealth(workspaceRoot, entry));
@@ -295,6 +421,7 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
   }
   const repoEntry = getRepoById(workspaceRoot, repoId);
   const repo = getRepoHealth(workspaceRoot, repoEntry);
+  const issueRef = options.issue ?? currentBranchIssueRef(repo.github, repo.branch, repo.resolvedPath);
   const dirtyRepos = repoHealth
     .filter((entry) => entry.id !== repo.id && entry.clean === false);
   const blocked: string[] = [];
@@ -351,12 +478,14 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
     }
   }
 
-  const result: Omit<CommitCreateResult, 'artifact'> = {
+  const baseResult: Omit<CommitCreateResult, 'artifact' | 'issueComment'> = {
     repo: repo.id,
+    githubRepo: repo.github,
     path: repo.resolvedPath,
     branch: repo.branch,
     headSha: repo.headSha,
     upstream: repo.upstream,
+    issue: issueRef,
     clean: repo.clean,
     statusLines: repo.statusLines,
     changes,
@@ -369,6 +498,17 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
     pushSkippedReason: pushPlan.skippedReason,
     blocked,
   };
+  const issueComment = buildIssueCommentResult(
+    issueRef,
+    options.confirm,
+    options.issueComment,
+    committed,
+    commitIssueCommentBody(baseResult)
+  );
+  const result: Omit<CommitCreateResult, 'artifact'> = {
+    ...baseResult,
+    issueComment,
+  };
 
   if (!options.writeArtifact) return result;
 
@@ -378,10 +518,12 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
       'input.json': JSON.stringify(
         {
           repo: repoId,
+          issue: options.issue ?? null,
           message: options.message ?? null,
           confirm: options.confirm ?? false,
           all: options.all ?? false,
           push: options.push ?? true,
+          issueComment: options.issueComment ?? true,
           validate: options.validate ?? [],
           writeArtifact: true,
         },
@@ -390,6 +532,8 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
       ),
       'result.json': JSON.stringify(result, null, 2),
       'summary.md': markdownSummary(result),
+      ...(issueComment ? { 'issue-comment.json': JSON.stringify(issueComment, null, 2) } : {}),
+      ...(issueComment ? { 'issue-comment.md': commitIssueCommentBody(baseResult) } : {}),
       'status.txt': repo.statusLines.join('\n'),
       'validation.json': JSON.stringify(validation, null, 2),
     }),

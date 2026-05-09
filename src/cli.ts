@@ -336,7 +336,7 @@ function issueStartOutcome(result: PrPlanResult) {
   const branch = result.developmentBranch?.branch ? ` on ${result.developmentBranch.branch}` : '';
 
   if (result.launched) {
-    return `Outcome: handed off to LLM adapter${branch}.${status}`;
+    return `Outcome: LLM adapter completed${branch}; no background session remains.${status}`;
   }
 
   if (result.launchError) {
@@ -359,10 +359,11 @@ function prReviewOutcome(result: PrPlanResult) {
     return 'Outcome: PR review loop blocked. Resolve the blocker above, then rerun the PR review command.';
   }
 
+  if (result.prReviewLoop?.completed) {
+    return 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.';
+  }
+
   if (result.launched) {
-    if (result.prReviewLoop?.completed) {
-      return 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.';
-    }
     return `Outcome: handed off to LLM adapter for PR review.${status}`;
   }
 
@@ -370,12 +371,23 @@ function prReviewOutcome(result: PrPlanResult) {
 }
 
 function printPrPlan(output: Output, result: PrPlanResult) {
-  const state = result.launchError ? 'blocked' : result.launched ? 'launched' : result.action === 'issue-start' ? 'dry run' : 'preflight only';
+  const state = result.launchError
+    ? 'blocked'
+    : result.action === 'review' && result.prReviewLoop?.completed && !result.launched
+      ? 'complete'
+      : result.launched
+        ? 'launched'
+        : result.action === 'issue-start'
+          ? 'dry run'
+          : 'preflight only';
   const label = result.action === 'issue-start' ? 'Issue start' : `PR ${result.action}`;
   output(`${label}: ${state}`);
   if (result.action !== 'issue-start' && result.issue) output(`Issue: ${result.issue}`);
   if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
   if (result.adapterCwd) output(`Adapter cwd: ${result.adapterCwd}`);
+  if (result.action === 'issue-start' && result.launched) {
+    output('Adapter run: completed (foreground process; no background session remains)');
+  }
   if (result.launchError) output(`Adapter error: ${result.launchError}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
   if (result.contextSummary) {
@@ -388,7 +400,10 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   }
   if (result.developmentBranch) {
     const branch = result.developmentBranch;
-    const branchSetupLabel = branch.command.startsWith('gh issue develop') ? 'Development branch link' : 'Development branch setup';
+    const branchSetupLabel =
+      branch.linked || branch.command.startsWith('gh issue develop') || branch.command.startsWith('gh api graphql createLinkedBranch')
+        ? 'Development branch link'
+        : 'Development branch setup';
     output(`Development branch: ${branch.applied ? 'ready' : 'planned'} ${branch.branch} from ${branch.base}`);
     output(`${branchSetupLabel}: ${branch.applied ? 'created' : 'planned'} ${branch.command}`);
     output(
@@ -464,6 +479,7 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   }
   if (result.merged !== undefined) output(`Merged: ${result.merged ? 'yes' : 'no'}`);
   printSummaryPosts(output, result.summaryPosts);
+  printFinalIssueComment(output, result.finalIssueComment);
   printLocalCleanup(output, result.localCleanup);
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
@@ -494,6 +510,14 @@ function printPrCreate(output: Output, result: PrCreateResult) {
   if (result.pushCommand) output(`Push: ${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}`);
   output(`Create: ${result.created ? 'created' : 'planned'} ${result.createCommand}`);
   if (result.url) output(`URL: ${result.url}`);
+  if (result.issueComment) {
+    const state = result.issueComment.applied
+      ? `posted ${result.issueComment.ref} ${result.issueComment.url ?? ''}`.trim()
+      : result.issueComment.error
+        ? `failed ${result.issueComment.ref}: ${result.issueComment.error}`
+        : `planned ${result.issueComment.ref} (${result.issueComment.reason ?? 'not posted'})`;
+    output(`Issue progress: ${state}`);
+  }
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
   for (const blocker of result.blocked) output(`blocked: ${blocker}`);
   if (result.campaignStatus) {
@@ -521,6 +545,17 @@ function printSummaryPosts(output: Output, posts: SummaryPostResult[] | undefine
     const state = post.applied ? 'posted' : post.error ? 'failed' : 'planned';
     output(`Summary ${post.target}: ${state} ${post.ref}${post.url ? ` ${post.url}` : ''}${post.reason ? ` (${post.reason})` : ''}`);
     if (post.error) output(`summary error: ${post.error}`);
+  }
+}
+
+function printFinalIssueComment(output: Output, post: SummaryPostResult | null | undefined) {
+  if (!post) return;
+  if (post.applied) {
+    output(`Victory issue: posted ${post.ref}${post.url ? ` ${post.url}` : ''}`);
+  } else if (post.error) {
+    output(`Victory issue: failed ${post.ref}: ${post.error}`);
+  } else {
+    output(`Victory issue: planned ${post.ref}${post.reason ? ` (${post.reason})` : ''}`);
   }
 }
 
@@ -593,9 +628,18 @@ function printCommitCreate(output: Output, result: CommitCreateResult) {
   output(`Commit create for ${result.repo}: ${result.committed ? 'committed' : 'preflight only'}`);
   output(`Path: ${result.path}`);
   output(`Branch: ${result.branch ?? 'unknown'}@${result.headSha ?? 'unknown'}`);
+  if (result.issue) output(`Issue: ${result.issue}`);
   output(`Suggested message: ${result.suggestedMessage}`);
   if (result.pushSkippedReason) output(`Push: skipped (${result.pushSkippedReason})`);
   else if (result.pushCommand) output(`Push: ${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}`);
+  if (result.issueComment) {
+    const state = result.issueComment.applied
+      ? `posted ${result.issueComment.issue} ${result.issueComment.url ?? ''}`.trim()
+      : result.issueComment.error
+        ? `failed ${result.issueComment.issue}: ${result.issueComment.error}`
+        : `planned ${result.issueComment.issue} (${result.issueComment.reason ?? 'not posted'})`;
+    output(`Issue progress: ${state}`);
+  }
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
   for (const change of result.changes) {
     const state = change.staged && change.unstaged ? 'staged+unstaged' : change.staged ? 'staged' : 'unstaged';
@@ -627,10 +671,71 @@ async function promptPrCreateAfterCommit(
       currentPath: result.path,
     });
     printPrCreate(output, created);
+    await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, {});
   } catch (error) {
     output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   }
+}
+
+async function promptPrCreateAfterIssueStart(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  result: PrPlanResult
+) {
+  if (result.action !== 'issue-start' || !result.launched || result.launchError || !result.adapterCwd) return;
+
+  const createPr = await promptConfirmation(output, input, 'Run `warroom pr create` next? [y/N]');
+  if (!createPr) return;
+
+  output('Creating PR...');
+  try {
+    const created = runPrCreate(workspaceRoot, {
+      confirm: true,
+      currentPath: result.adapterCwd,
+      issue: result.issue ?? undefined,
+      // Leave title/body unset so pr create asks the adapter to summarize the actual branch commits and diff.
+    });
+    printPrCreate(output, created);
+    await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, {});
+  } catch (error) {
+    output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+}
+
+function prRefFromCreateResult(result: PrCreateResult) {
+  const match = result.url?.match(/^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/(\d+)/);
+  return match ? `${match[1]}#${match[2]}` : null;
+}
+
+async function promptPrReviewAfterPrCreate(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  result: PrCreateResult,
+  options: { confirmStatus?: boolean; writeArtifact?: boolean }
+) {
+  if (!result.created) return;
+  const prRef = prRefFromCreateResult(result);
+  if (!prRef) return;
+
+  const reviewPr = await promptConfirmation(output, input, 'Run `warroom pr review` next? [y/N]');
+  if (!reviewPr) return;
+
+  output(`Starting PR review for ${prRef}`);
+  const review = await runPrReview(workspaceRoot, {
+    pr: prRef,
+    issue: result.issue ?? undefined,
+    dryRun: false,
+    confirmStatus: options.confirmStatus,
+    writeArtifact: options.writeArtifact,
+    reviewStatus: output,
+    waitForInitialCodeRabbit: true,
+  });
+  printPrPlan(output, review);
+  if (review.launchError) process.exitCode = 1;
 }
 
 function printAbort(output: Output, result: AbortResult) {
@@ -1059,6 +1164,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           }
           printPrPlan(output, plan);
           if (plan.launchError) process.exitCode = 1;
+          if (interactive) await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan);
           return;
         }
 
@@ -1105,6 +1211,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         });
         printPrPlan(output, plan);
         if (plan.launchError) process.exitCode = 1;
+        await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan);
       }
     );
 
@@ -1120,6 +1227,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--draft', 'Create the PR as a draft.')
     .option('--confirm', 'Push the branch and create the PR.')
     .option('--confirm-status', 'Move the linked issue to skirmish after creating the PR.')
+    .option('--no-issue-comment', 'Do not post the generated PR summary back to the linked issue after creation.')
     .option('--no-push', 'Create the PR without pushing first.')
     .option('--write-artifact', 'Write PR body/result artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
@@ -1132,6 +1240,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       draft?: boolean;
       confirm?: boolean;
       confirmStatus?: boolean;
+      issueComment?: boolean;
       push?: boolean;
       writeArtifact?: boolean;
       json?: boolean;
@@ -1145,6 +1254,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         draft: opts.draft,
         confirm: opts.confirm,
         confirmStatus: opts.confirmStatus,
+        issueComment: opts.issueComment,
         push: opts.push,
         writeArtifact: opts.writeArtifact,
         currentPath: invocationCwd,
@@ -1155,7 +1265,15 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       }
       printPrCreate(output, result);
 
-      if (opts.confirm || !interactive || result.created || result.blocked.length > 0) return;
+      if (interactive && result.created) {
+        await promptPrReviewAfterPrCreate(workspaceRoot, output, input, result, {
+          confirmStatus: opts.confirmStatus,
+          writeArtifact: opts.writeArtifact,
+        });
+        return;
+      }
+
+      if (opts.confirm || !interactive || result.blocked.length > 0) return;
 
       const confirmed = await promptConfirmation(output, input, 'Push this branch and create the GitHub PR now? [y/N]');
       if (!confirmed) {
@@ -1175,11 +1293,16 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           draft: opts.draft,
           confirm: true,
           confirmStatus: opts.confirmStatus,
+          issueComment: opts.issueComment,
           push: opts.push,
           writeArtifact: opts.writeArtifact,
           currentPath: invocationCwd,
         });
         printPrCreate(output, created);
+        await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, {
+          confirmStatus: opts.confirmStatus,
+          writeArtifact: opts.writeArtifact,
+        });
       } catch (error) {
         output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
         process.exitCode = 1;
@@ -1295,6 +1418,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--summary <text>', 'Victory summary to include in local artifacts and optional comments.')
     .option('--post-summary', 'Plan or post victory summary comments to the PR and linked issue.')
     .option('--confirm-summary', 'Actually post victory summary comments. Implies --post-summary.')
+    .option('--no-issue-comment', 'Do not post the final victory closeout comment back to the linked issue after merge.')
     .option('--cleanup-local', 'Plan or return the mapped local checkout to the PR base branch and pull it.')
     .option('--confirm-cleanup', 'Actually switch the mapped local checkout and pull when cleanup is safe. Implies --cleanup-local.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
@@ -1307,6 +1431,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       summary?: string;
       postSummary?: boolean;
       confirmSummary?: boolean;
+      issueComment?: boolean;
       cleanupLocal?: boolean;
       confirmCleanup?: boolean;
       writeArtifact?: boolean;
@@ -1331,6 +1456,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         summary: opts.summary,
         postSummary: opts.postSummary || opts.confirmSummary,
         confirmSummary: opts.confirmSummary,
+        issueComment: opts.issueComment,
         cleanupLocal: opts.cleanupLocal || opts.confirmCleanup,
         confirmCleanup: opts.confirmCleanup,
         writeArtifact: opts.writeArtifact,
@@ -1382,6 +1508,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             summary: opts.summary,
             postSummary: opts.postSummary || opts.confirmSummary,
             confirmSummary: opts.confirmSummary,
+            issueComment: opts.issueComment,
             cleanupLocal: opts.cleanupLocal || opts.confirmCleanup,
             confirmCleanup: opts.confirmCleanup,
             writeArtifact: opts.writeArtifact,
@@ -1409,14 +1536,16 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .command('create')
     .description('Inspect a child repo and optionally create a conventional commit.')
     .option('--repo <id>', 'Repo id from repos.yaml. Defaults to the current mapped child repo or single active mapped development branch.')
+    .option('--issue <owner/repo#number>', 'Issue to post commit progress to. Defaults to branch metadata or warroom/<number>-... inference.')
     .option('--message <message>', 'Commit message to use.')
     .option('--validate <command>', 'Validation command to run from the target repo before commit. Repeatable.', collect, [])
     .option('--write-artifact', 'Write input/result/summary artifacts under .warroom/runs.')
     .option('--all', 'Stage all changes before committing. Requires --confirm or interactive approval.')
     .option('--no-push', 'Create the commit without pushing to the remote branch.')
+    .option('--no-issue-comment', 'Do not post the commit progress comment back to the linked issue after commit.')
     .option('--confirm', 'Actually create the commit and push it to the remote branch.')
     .option('--json', 'Print machine-readable output.')
-    .action(async (opts: { repo?: string; message?: string; validate?: string[]; writeArtifact?: boolean; all?: boolean; push?: boolean; confirm?: boolean; json?: boolean }) => {
+    .action(async (opts: { repo?: string; issue?: string; message?: string; validate?: string[]; writeArtifact?: boolean; all?: boolean; push?: boolean; issueComment?: boolean; confirm?: boolean; json?: boolean }) => {
       const commandOptions = { ...opts, currentPath: invocationCwd };
       const result = runCommitCreate(workspaceRoot, opts.confirm ? commandOptions : { ...commandOptions, confirm: false });
       if (opts.json) {
