@@ -2171,6 +2171,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     : {};
   const commits = commitSummary(repo.resolvedPath, base, branch);
   const files = changedFiles(repo.resolvedPath, base, branch);
+  const uncommittedFiles = repo.branch === branch ? gitStatusPaths(repo.resolvedPath) : [];
   const fallbackTitle =
     options.title ??
     issue.title ??
@@ -2189,6 +2190,16 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
 
   if (branch === base) blocked.push(`Refusing to create a PR from base branch ${base}.`);
   if (!branchExists(repo.resolvedPath, branch)) blocked.push(`Local branch does not exist: ${branch}.`);
+  if (uncommittedFiles.length > 0) {
+    blocked.push(
+      `Repo has ${uncommittedFiles.length} uncommitted change${
+        uncommittedFiles.length === 1 ? '' : 's'
+      }. Run \`warroom commit create\` before creating a PR.`
+    );
+  }
+  if (commits.length === 0) {
+    blocked.push(`No commits found on ${branch} ahead of ${base}. Run \`warroom commit create\` before creating a PR.`);
+  }
 
   const existingPrs = ghJson<Array<{ number?: number; url?: string }>>(
     ['pr', 'list', '--repo', repo.github, '--state', 'open', '--head', branch, '--json', 'number,url', '--limit', '10'],

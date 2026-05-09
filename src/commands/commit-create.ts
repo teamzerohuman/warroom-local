@@ -1,6 +1,9 @@
 import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
+import { getAdapterInvocation, runAdapter } from '../lib/env.js';
 import { getRepoById, getRepoHealth, loadRepoManifest, runGit, type RepoHealth } from '../lib/repos.js';
 
 export type CommitCreateOptions = {
@@ -356,7 +359,130 @@ function postIssueProgressComment(issue: string, body: string): IssueProgressCom
   };
 }
 
-function commitIssueCommentBody(result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>) {
+function parseJsonObject(raw: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start === -1 || end <= start) throw new Error('Adapter output did not contain a JSON object.');
+    return JSON.parse(raw.slice(start, end + 1));
+  }
+}
+
+function parseCommitSummary(raw: string) {
+  const parsed = parseJsonObject(raw);
+  if (!parsed || typeof parsed !== 'object') throw new Error('Adapter output JSON was not an object.');
+  const summary = (parsed as Record<string, unknown>).summary;
+  if (typeof summary !== 'string' || !summary.trim()) {
+    throw new Error('Adapter output did not include a non-empty summary.');
+  }
+  return summary.trim();
+}
+
+function runAdapterForFinalMessage(workspaceRoot: string, repoPath: string, prompt: string) {
+  const outputDir = mkdtempSync(path.join(tmpdir(), 'warroom-commit-summary-'));
+  const outputPath = path.join(outputDir, 'last-message.txt');
+  try {
+    const launch = runAdapter(workspaceRoot, prompt, {
+      cwd: repoPath,
+      outputLastMessagePath: outputPath,
+      captureStdout: true,
+    });
+    const message = existsSync(outputPath) ? readFileSync(outputPath, 'utf8') : (launch.stdout?.trim() ?? '');
+    return {
+      message,
+      adapterCommand: launch.invocation.display,
+      error: launch.launched ? null : launch.error ?? 'LLM adapter failed.',
+    };
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
+}
+
+function gitShow(repoPath: string, sha: string | null) {
+  if (!sha) return '';
+  const result = runGit(repoPath, ['show', '--stat', '--patch', '--find-renames', '--find-copies', '--unified=3', '--no-ext-diff', sha]);
+  return result.status === 0 ? result.stdout : '';
+}
+
+function trimPromptSection(value: string, maxLength: number) {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength)}\n[truncated ${value.length - maxLength} characters by warroom]`;
+}
+
+function buildCommitSummaryPrompt(result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>, diff: string) {
+  return [
+    'War Room commit update summary.',
+    '',
+    'Return only JSON with exactly this string field:',
+    '{"summary":"..."}',
+    '',
+    'Rules:',
+    '- Summarize what changed in this commit for the GitHub issue audience.',
+    '- Prefer business or implementation impact over listing files.',
+    '- Mention tests, docs, validation, migrations, public APIs, or operational risk only when visible below.',
+    '- Do not include secrets, private env values, PII, or raw customer data.',
+    '- Do not wrap the JSON in markdown fences.',
+    '',
+    `Repository: ${result.githubRepo}`,
+    `Branch: ${result.branch ?? 'unknown'}`,
+    result.committedSha ? `Commit: ${result.committedSha}` : 'Commit: unknown',
+    `Commit title: ${result.suggestedMessage}`,
+    '',
+    'Validation requested:',
+    result.validation.length
+      ? result.validation
+          .map((validation) => `- ${validation.ok ? 'passed' : 'failed'}: ${validation.command} (exit ${validation.status ?? 'unknown'})`)
+          .join('\n')
+      : '- none requested through warroom commit create',
+    '',
+    'Committed diff:',
+    trimPromptSection(diff || '(diff unavailable)', 60_000),
+  ].join('\n');
+}
+
+function fallbackCommitSummary(result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>) {
+  const changed = result.changes.length;
+  const validation = result.validation.length
+    ? ` Validation ${result.validation.every((entry) => entry.ok) ? 'passed' : 'had failures'} for ${result.validation
+        .map((entry) => `\`${entry.command}\``)
+        .join(', ')}.`
+    : '';
+  return `Committed \`${result.suggestedMessage}\` with ${changed} changed file${changed === 1 ? '' : 's'}.${validation}`.trim();
+}
+
+function generateCommitSummary(workspaceRoot: string, result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>) {
+  if (!result.committed || !result.committedSha) {
+    return { summary: fallbackCommitSummary(result), adapterCommand: null as string | null, error: null as string | null };
+  }
+
+  let adapterCommand: string | null = null;
+  try {
+    const diff = gitShow(result.path, result.committedSha);
+    const adapter = runAdapterForFinalMessage(workspaceRoot, result.path, buildCommitSummaryPrompt(result, diff));
+    adapterCommand = adapter.adapterCommand;
+    if (adapter.error) {
+      return { summary: fallbackCommitSummary(result), adapterCommand, error: adapter.error };
+    }
+    if (!adapter.message) {
+      return { summary: fallbackCommitSummary(result), adapterCommand, error: 'LLM adapter completed but did not return a final message.' };
+    }
+    return { summary: parseCommitSummary(adapter.message), adapterCommand, error: null };
+  } catch (error) {
+    return {
+      summary: fallbackCommitSummary(result),
+      adapterCommand: adapterCommand ?? getAdapterInvocation(workspaceRoot, result.path).display,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function commitIssueCommentBody(
+  workspaceRoot: string,
+  result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>,
+  summaryResult = generateCommitSummary(workspaceRoot, result)
+) {
   const lines = [
     '## War Room commit update',
     '',
@@ -366,17 +492,9 @@ function commitIssueCommentBody(result: Omit<CommitCreateResult, 'artifact' | 'i
     `Title: ${result.suggestedMessage}`,
     `Pushed: ${result.pushed ? 'yes' : result.pushSkippedReason ? `no (${result.pushSkippedReason})` : 'no'}`,
     '',
-    'Changed files:',
+    'Summary:',
+    summaryResult.summary,
   ].filter((line): line is string => line !== null);
-
-  if (result.changes.length === 0) {
-    lines.push('- none');
-  } else {
-    for (const change of result.changes) {
-      const state = change.staged && change.unstaged ? 'staged+unstaged' : change.staged ? 'staged' : 'unstaged';
-      lines.push(`- ${change.indexStatus}${change.worktreeStatus} ${change.path} (${state})`);
-    }
-  }
 
   lines.push('', 'Validation:');
   if (result.validation.length === 0) {
@@ -498,12 +616,14 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
     pushSkippedReason: pushPlan.skippedReason,
     blocked,
   };
+  const issueCommentBody =
+    issueRef && options.issueComment !== false ? commitIssueCommentBody(workspaceRoot, baseResult) : null;
   const issueComment = buildIssueCommentResult(
     issueRef,
     options.confirm,
     options.issueComment,
     committed,
-    commitIssueCommentBody(baseResult)
+    issueCommentBody
   );
   const result: Omit<CommitCreateResult, 'artifact'> = {
     ...baseResult,
@@ -533,7 +653,7 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
       'result.json': JSON.stringify(result, null, 2),
       'summary.md': markdownSummary(result),
       ...(issueComment ? { 'issue-comment.json': JSON.stringify(issueComment, null, 2) } : {}),
-      ...(issueComment ? { 'issue-comment.md': commitIssueCommentBody(baseResult) } : {}),
+      ...(issueCommentBody ? { 'issue-comment.md': issueCommentBody } : {}),
       'status.txt': repo.statusLines.join('\n'),
       'validation.json': JSON.stringify(validation, null, 2),
     }),

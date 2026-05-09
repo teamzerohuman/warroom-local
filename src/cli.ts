@@ -45,6 +45,7 @@ import {
 } from './commands/pr.js';
 import { runSync, type SyncResult } from './commands/sync.js';
 import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
+import { runGit } from './lib/repos.js';
 import { findWarRoomWorkspace } from './lib/workspace.js';
 
 type Output = (text: string) => void;
@@ -750,6 +751,93 @@ async function promptPrCreateAfterCommit(
   }
 }
 
+type IssueStartPrReadiness = {
+  ready: boolean;
+  dirty: boolean;
+  dirtyCount: number;
+  repoPath: string;
+  branch: string;
+  base: string;
+  blocker: string | null;
+};
+
+function issueStartPrReadiness(result: PrPlanResult): IssueStartPrReadiness | null {
+  const repoPath = result.adapterCwd ?? result.developmentBranch?.path;
+  const branch = result.developmentBranch?.branch;
+  const base = result.developmentBranch?.base;
+  if (!repoPath || !branch || !base) return null;
+
+  const currentBranch = runGit(repoPath, ['branch', '--show-current']);
+  if (currentBranch.status !== 0) {
+    return {
+      ready: false,
+      dirty: false,
+      dirtyCount: 0,
+      repoPath,
+      branch,
+      base,
+      blocker: currentBranch.stderr || `Could not read current branch in ${repoPath}.`,
+    };
+  }
+  if (currentBranch.stdout !== branch) {
+    return {
+      ready: false,
+      dirty: false,
+      dirtyCount: 0,
+      repoPath,
+      branch,
+      base,
+      blocker: `Expected checkout on ${branch}, but ${repoPath} is on ${currentBranch.stdout || 'unknown'}.`,
+    };
+  }
+
+  const status = runGit(repoPath, ['status', '--short', '--untracked-files=all']);
+  if (status.status !== 0) {
+    return {
+      ready: false,
+      dirty: false,
+      dirtyCount: 0,
+      repoPath,
+      branch,
+      base,
+      blocker: status.stderr || `Could not inspect uncommitted changes in ${repoPath}.`,
+    };
+  }
+
+  const dirtyCount = status.stdout.split(/\r?\n/).filter(Boolean).length;
+  if (dirtyCount > 0) {
+    return { ready: false, dirty: true, dirtyCount, repoPath, branch, base, blocker: null };
+  }
+
+  const commits = runGit(repoPath, ['rev-list', '--count', `${base}..${branch}`]);
+  if (commits.status !== 0) {
+    return {
+      ready: false,
+      dirty: false,
+      dirtyCount: 0,
+      repoPath,
+      branch,
+      base,
+      blocker: commits.stderr || `Could not compare ${branch} with ${base}.`,
+    };
+  }
+
+  const commitCount = Number(commits.stdout);
+  if (!Number.isFinite(commitCount) || commitCount <= 0) {
+    return {
+      ready: false,
+      dirty: false,
+      dirtyCount: 0,
+      repoPath,
+      branch,
+      base,
+      blocker: `No commits found on ${branch} ahead of ${base}.`,
+    };
+  }
+
+  return { ready: true, dirty: false, dirtyCount: 0, repoPath, branch, base, blocker: null };
+}
+
 async function promptPrCreateAfterIssueStart(
   workspaceRoot: string,
   output: Output,
@@ -757,6 +845,45 @@ async function promptPrCreateAfterIssueStart(
   result: PrPlanResult
 ) {
   if (result.action !== 'issue-start' || !result.launched || result.launchError || !result.adapterCwd) return;
+
+  const readiness = issueStartPrReadiness(result);
+  if (readiness?.dirty) {
+    output(
+      `PR create is not ready: ${readiness.dirtyCount} uncommitted change${
+        readiness.dirtyCount === 1 ? '' : 's'
+      } ${readiness.dirtyCount === 1 ? 'remains' : 'remain'} in ${readiness.repoPath}.`
+    );
+    const commitNow = await promptConfirmation(
+      output,
+      input,
+      `Run \`warroom commit create --issue ${result.issue ?? '<issue>'}\` now? This will stage all current changes before committing. [y/N]`
+    );
+    if (!commitNow) return;
+
+    output('Creating commit and pushing...');
+    try {
+      const committed = runCommitCreate(workspaceRoot, {
+        currentPath: readiness.repoPath,
+        issue: result.issue ?? undefined,
+        confirm: true,
+        all: true,
+      });
+      printCommitCreate(output, committed);
+      await promptPrCreateAfterCommit(workspaceRoot, output, input, committed);
+    } catch (error) {
+      output(`Commit create failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  if (readiness && !readiness.ready) {
+    output(`PR create is not ready: ${readiness.blocker ?? 'branch is not ready for PR creation.'}`);
+    output(
+      `Outcome: PR create was not offered. Commit the implementation on ${readiness.branch}, then rerun \`warroom pr create\`.`
+    );
+    return;
+  }
 
   const createPr = await promptConfirmation(output, input, 'Run `warroom pr create` next? [y/N]');
   if (!createPr) return;

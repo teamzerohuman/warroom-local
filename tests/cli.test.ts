@@ -224,6 +224,46 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('offers commit creation instead of PR creation when issue start leaves uncommitted changes', async () => {
+    const { root, sdk } = makeCommitFixture();
+    writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
+    commitAll(sdk, 'fixture sdk');
+
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeDirtyImplementationCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = new PassThrough();
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      const answers = ['1\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'issue', 'next']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
+
+      expect(lines).toContain('Issue start: launched');
+      expect(lines).toContain(`PR create is not ready: 1 uncommitted change remains in ${sdk}.`);
+      expect(lines).toContain('Run `warroom commit create --issue TeamFloPay/sdk#7` now? This will stage all current changes before committing. [y/N]');
+      expect(lines).not.toContain('Run `warroom pr create` next? [y/N]');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
   it('starts an ally issue in the mapped implementation owner repo from triage notes', async () => {
     const root = makeDevFixture();
     const backend = addBackendRepoFixture(root);
@@ -805,6 +845,35 @@ describe('phase-1 CLI', () => {
         { encoding: 'utf8' }
       );
       expect(remoteBranch.status).toBe(0);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('blocks PR creation when the branch has no commits ahead of base', async () => {
+    const { root, sdk } = makeCommitFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+    writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
+    commitAll(sdk, 'fixture sdk');
+    const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
+    if (branch.status !== 0) throw new Error(branch.stderr);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'create']);
+
+      expect(lines).toContain('PR create: preflight only');
+      expect(lines).toContain('blocked: No commits found on warroom/7-build-the-selector ahead of main. Run `warroom commit create` before creating a PR.');
+      expect(lines).toContain('Outcome: PR not created. Resolve the blocked items above, then rerun `warroom pr create --confirm`.');
+      expect(lines.some((line) => line.includes('Adapter: codex exec -o '))).toBe(false);
     } finally {
       process.env.PATH = originalPath;
     }
@@ -1532,8 +1601,10 @@ describe('phase-1 CLI', () => {
   it('posts commit progress to the linked issue after a confirmed commit', () => {
     const { root, sdk } = makeCommitFixture();
     const bin = path.join(root, 'bin');
+    const commentLog = path.join(root, 'issue-comments.log');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
+    writeCodexFixture(bin);
     writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
     commitAll(sdk, 'fixture sdk');
     const pushMain = spawnSync('git', ['push', '-u', 'origin', 'main'], { cwd: sdk, encoding: 'utf8' });
@@ -1544,7 +1615,9 @@ describe('phase-1 CLI', () => {
     writeFileSync(path.join(sdk, 'index.ts'), 'export const value = 1;\n');
 
     const originalPath = process.env.PATH;
+    const originalCommentLog = process.env.WARROOM_GH_ISSUE_COMMENT_LOG;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_GH_ISSUE_COMMENT_LOG = commentLog;
     try {
       const result = runCommitCreate(root, {
         repo: 'sdk',
@@ -1557,8 +1630,16 @@ describe('phase-1 CLI', () => {
       expect(result.issue).toBe('TeamFloPay/sdk#7');
       expect(result.issueComment?.applied).toBe(true);
       expect(result.issueComment?.url).toBe('https://github.com/TeamFloPay/sdk/issues/7#issuecomment-2');
+      const comment = readFileSync(commentLog, 'utf8');
+      expect(comment).toContain('## War Room commit update');
+      expect(comment).toContain('Summary:');
+      expect(comment).toContain('Implemented the selector commit by adding the runtime export used by the SDK workflow');
+      expect(comment).not.toContain('Changed files:');
+      expect(comment).not.toContain('index.ts (');
     } finally {
       process.env.PATH = originalPath;
+      if (originalCommentLog === undefined) delete process.env.WARROOM_GH_ISSUE_COMMENT_LOG;
+      else process.env.WARROOM_GH_ISSUE_COMMENT_LOG = originalCommentLog;
     }
   });
 
@@ -1602,6 +1683,8 @@ describe('phase-1 CLI', () => {
 
   it('can open a PR directly after an interactive commit', async () => {
     const { root, sdk } = makeCommitFixture();
+    writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
+    commitAll(sdk, 'fixture sdk');
     const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
     if (branch.status !== 0) throw new Error(branch.stderr);
     writeFileSync(path.join(sdk, 'index.ts'), 'export const value = 1;\n');
@@ -3304,6 +3387,10 @@ if (args[0] === 'pr' && args[1] === 'comment') {
 if (args[0] === 'issue' && args[1] === 'comment') {
   const repo = optionValue('--repo') || 'TeamFloPay/backend';
   const number = args[2] || '562';
+  const body = optionValue('--body') || '';
+  if (process.env.WARROOM_GH_ISSUE_COMMENT_LOG) {
+    require('node:fs').appendFileSync(process.env.WARROOM_GH_ISSUE_COMMENT_LOG, body + '\\n---COMMENT---\\n');
+  }
   process.stdout.write('https://github.com/' + repo + '/issues/' + number + '#issuecomment-2');
   process.exit(0);
 }
@@ -4250,6 +4337,7 @@ function writeCodexFixture(bin: string) {
     `#!/usr/bin/env node
 const fs = require('node:fs');
 const path = require('node:path');
+const { spawnSync } = require('node:child_process');
 if (process.argv[2] !== 'exec') {
   fs.writeFileSync(path.join(path.dirname(process.argv[1]), 'triage-notes-posted'), '1');
   process.exit(0);
@@ -4270,6 +4358,10 @@ process.stdin.on('end', () => {
       fs.writeFileSync(args[outputIndex + 1], JSON.stringify({
         summary: 'This chunk updates selector-related implementation details and preserves the important changed files for the final PR summary.'
       }));
+    } else if (input.includes('War Room commit update summary')) {
+      fs.writeFileSync(args[outputIndex + 1], JSON.stringify({
+        summary: 'Implemented the selector commit by adding the runtime export used by the SDK workflow, with no validation run through warroom commit create.'
+      }));
     } else {
       fs.writeFileSync(args[outputIndex + 1], JSON.stringify({
         title: 'Build the selector',
@@ -4286,6 +4378,37 @@ process.stdin.on('end', () => {
         ].join('\\n')
       }));
     }
+  } else if (input.includes('War Room implementation handoff')) {
+    fs.writeFileSync(path.join(process.cwd(), 'selector.ts'), 'export const selector = true;\\n');
+    spawnSync('git', ['add', 'selector.ts'], { cwd: process.cwd(), encoding: 'utf8' });
+    spawnSync('git', ['commit', '-m', 'feat: build selector'], { cwd: process.cwd(), encoding: 'utf8' });
+  }
+  process.exit(0);
+});
+`
+  );
+  chmodSync(codexPath, 0o755);
+}
+
+function writeDirtyImplementationCodexFixture(bin: string) {
+  const codexPath = path.join(bin, 'codex');
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+const fs = require('node:fs');
+const path = require('node:path');
+if (process.argv[2] !== 'exec') {
+  fs.writeFileSync(path.join(path.dirname(process.argv[1]), 'triage-notes-posted'), '1');
+  process.exit(0);
+}
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+});
+process.stdin.on('end', () => {
+  if (input.includes('War Room implementation handoff')) {
+    fs.writeFileSync(path.join(process.cwd(), 'selector.ts'), 'export const selector = true;\\n');
   }
   process.exit(0);
 });
