@@ -382,14 +382,15 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Repo: TeamFloPay/sdk');
       expect(lines).toContain('Title: Report checkout settlement confusion');
       expect(lines).toContain('Issue type: Bug');
-      expect(lines).toContain('Labels: needs-triage, checkout');
+      expect(lines).toContain('Labels: needs-triage');
+      expect(lines).toContain('Draft warning: Ignored label "checkout" because it does not exist in TeamFloPay/sdk.');
       expect(lines).toContain('Create this GitHub issue now? [y/N]');
       expect(lines).toContain('Issue create: created');
       expect(lines).toContain('URL: https://github.com/TeamFloPay/sdk/issues/123');
       expect(lines).toContain('Issue type: updated TeamFloPay/sdk#123 -> Bug');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#123 -> needs-triage');
       expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#123 +needs-triage');
-      expect(lines).toContain('Outcome: issue created and queued for triage.');
+      expect(lines).toContain('Outcome: issue created with follow-up warnings. draft warning: Ignored label "checkout" because it does not exist in TeamFloPay/sdk.');
       expect(lines).toContain('Run `warroom issue triage --issue TeamFloPay/sdk#123` now? [y/N]');
       expect(lines).toContain('Triaging TeamFloPay/sdk#123');
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/sdk/issues/123#issuecomment-triage');
@@ -3298,11 +3299,32 @@ if (args[0] === 'issue' && args[1] === 'create') {
   const repo = optionValue('--repo');
   const title = optionValue('--title');
   const body = readFileSync(0, 'utf8');
-  if (repo !== 'TeamFloPay/sdk' || title !== 'Report checkout settlement confusion' || !body.includes('Customer support needs a clear issue')) {
+  const labels = args
+    .map((arg, index) => (arg === '--label' ? args[index + 1] : null))
+    .filter(Boolean);
+  if (
+    repo !== 'TeamFloPay/sdk' ||
+    title !== 'Report checkout settlement confusion' ||
+    !body.includes('Customer support needs a clear issue') ||
+    labels.includes('checkout') ||
+    !labels.includes('needs-triage')
+  ) {
     process.stderr.write('unexpected issue create payload');
     process.exit(1);
   }
   process.stdout.write('https://github.com/TeamFloPay/sdk/issues/123');
+  process.exit(0);
+}
+
+if (args[0] === 'label' && args[1] === 'list') {
+  json([
+    { name: 'needs-triage' },
+    { name: 'ready-to-engage' },
+    { name: 'battlefield-active' },
+    { name: 'skirmish' },
+    { name: 'blockaded' },
+    { name: 'victory' }
+  ]);
   process.exit(0);
 }
 

@@ -337,6 +337,7 @@ function issueCreateOutcome(result: IssueCreateResult) {
   }
   if (result.created) {
     const warnings = [
+      ...result.draftWarnings.map((warning) => `draft warning: ${warning}`),
       result.closeoutError ? `closeout warning: ${result.closeoutError}` : null,
       result.issueTypeUpdate?.error ? `issue type warning: ${result.issueTypeUpdate.error}` : null,
     ].filter((warning): warning is string => Boolean(warning));
@@ -358,6 +359,7 @@ function printIssueCreate(output: Output, result: IssueCreateResult) {
   if (result.draftPath) output(`Draft file: ${result.draftPath}`);
   output(`Context size: ${result.contextSummary.promptCharacters} chars`);
   if (result.draftError) output(`Draft error: ${result.draftError}`);
+  for (const warning of result.draftWarnings) output(`Draft warning: ${warning}`);
   if (result.draft) {
     output(`Repo: ${result.draft.repo}`);
     output(`Title: ${result.draft.title}`);

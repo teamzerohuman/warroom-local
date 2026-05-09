@@ -111,6 +111,7 @@ export type IssueCreateResult = {
   launchError: string | null;
   draft: IssueCreateDraft | null;
   draftError: string | null;
+  draftWarnings: string[];
   created: boolean;
   issue: string | null;
   url: string | null;
@@ -300,9 +301,113 @@ function stringArray(value: unknown): string[] {
   return [];
 }
 
-function normalizeIssueCreateDraft(workspaceRoot: string, raw: unknown): { draft: IssueCreateDraft | null; error: string | null } {
+function listRepoLabelNames(repo: string) {
+  const result = spawnSync('gh', ['label', 'list', '--repo', repo, '--json', 'name', '--limit', '1000'], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    return {
+      labels: [] as string[],
+      error: `${result.stderr || result.stdout}`.trim() || `gh label list failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout || '[]') as Array<{ name?: string }>;
+    return { labels: labelsFromGh(parsed), error: null };
+  } catch {
+    return { labels: [] as string[], error: 'Could not parse gh label list output.' };
+  }
+}
+
+function listOrgIssueTypeNames(owner: string) {
+  const query = `
+query IssueTypeLookup($org: String!) {
+  organization(login: $org) {
+    issueTypes(first: 50) {
+      nodes {
+        name
+        isEnabled
+      }
+    }
+  }
+}
+`;
+  const result = spawnSync('gh', ['api', 'graphql', '-f', `query=${query}`, '-f', `org=${owner}`], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return {
+      issueTypes: [] as string[],
+      error: `${result.stderr || result.stdout}`.trim() || `gh api graphql failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+
+  try {
+    const parsed = JSON.parse(result.stdout || '{}') as {
+      data?: {
+        organization?: { issueTypes?: { nodes?: Array<{ name?: string; isEnabled?: boolean } | null> } | null } | null;
+      };
+    };
+    const issueTypes =
+      parsed.data?.organization?.issueTypes?.nodes
+        ?.filter((entry): entry is { name?: string; isEnabled?: boolean } => Boolean(entry))
+        .filter((entry) => entry.isEnabled !== false)
+        .map((entry) => entry.name)
+        .filter((name): name is string => Boolean(name)) ?? [];
+    return { issueTypes, error: null };
+  } catch {
+    return { issueTypes: [] as string[], error: 'Could not parse issue type lookup response.' };
+  }
+}
+
+function validateIssueCreateLabels(repo: string, generatedLabels: string[], requestedLabels: string[]) {
+  const lookup = listRepoLabelNames(repo);
+  if (lookup.error) return { labels: [] as string[], error: `Could not fetch labels for ${repo}: ${lookup.error}`, warnings: [] as string[] };
+
+  const availableByLower = new Map(lookup.labels.map((label) => [label.toLowerCase(), label]));
+  const generatedByLower = new Set(generatedLabels.map((label) => label.toLowerCase()));
+  const labels: string[] = [];
+  const warnings: string[] = [];
+  const missingRequired: string[] = [];
+
+  for (const label of uniqueStrings([...generatedLabels, ...requestedLabels])) {
+    const match = availableByLower.get(label.toLowerCase());
+    if (match) {
+      labels.push(match);
+      continue;
+    }
+
+    if (generatedByLower.has(label.toLowerCase())) missingRequired.push(label);
+    else warnings.push(`Ignored label "${label}" because it does not exist in ${repo}.`);
+  }
+
+  if (missingRequired.length > 0) {
+    return {
+      labels: [] as string[],
+      error: `Required issue label${missingRequired.length === 1 ? '' : 's'} missing in ${repo}: ${missingRequired.join(', ')}.`,
+      warnings,
+    };
+  }
+
+  return { labels: uniqueStrings(labels), error: null, warnings };
+}
+
+function validateIssueCreateType(repo: string, issueType: string | null) {
+  if (!issueType) return { issueType: null, warnings: [] as string[] };
+  const parts = repoParts(repo);
+  if (!parts) return { issueType: null, warnings: [`Ignored issue type "${issueType}" because ${repo} is not a valid owner/repo.`] };
+  const lookup = listOrgIssueTypeNames(parts.owner);
+  if (lookup.error) return { issueType: null, warnings: [`Ignored issue type "${issueType}" because issue types could not be fetched: ${lookup.error}`] };
+  const match = lookup.issueTypes.find((type) => type.toLowerCase() === issueType.toLowerCase());
+  if (!match) {
+    const available = lookup.issueTypes.length ? lookup.issueTypes.join(', ') : 'none';
+    return { issueType: null, warnings: [`Ignored issue type "${issueType}" because it does not exist for ${parts.owner}. Available: ${available}.`] };
+  }
+  return { issueType: match, warnings: [] as string[] };
+}
+
+function normalizeIssueCreateDraft(workspaceRoot: string, raw: unknown): { draft: IssueCreateDraft | null; error: string | null; warnings: string[] } {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { draft: null, error: 'Issue draft JSON must be an object.' };
+    return { draft: null, error: 'Issue draft JSON must be an object.', warnings: [] };
   }
   const record = raw as Record<string, unknown>;
   const repo = typeof record.repo === 'string' ? record.repo.trim() : '';
@@ -317,39 +422,46 @@ function normalizeIssueCreateDraft(workspaceRoot: string, raw: unknown): { draft
   const assignees = uniqueStrings(stringArray(record.assignees));
   const milestone = typeof record.milestone === 'string' && record.milestone.trim() ? record.milestone.trim() : null;
 
-  if (!repo) return { draft: null, error: 'Issue draft is missing repo.' };
+  if (!repo) return { draft: null, error: 'Issue draft is missing repo.', warnings: [] };
   if (!isKnownIssueRepo(workspaceRoot, repo)) {
-    return { draft: null, error: `Issue draft repo is not mapped in repos.yaml or allies.yaml: ${repo}.` };
+    return { draft: null, error: `Issue draft repo is not mapped in repos.yaml or allies.yaml: ${repo}.`, warnings: [] };
   }
-  if (!title) return { draft: null, error: 'Issue draft is missing title.' };
-  if (!body) return { draft: null, error: 'Issue draft is missing body.' };
+  if (!title) return { draft: null, error: 'Issue draft is missing title.', warnings: [] };
+  if (!body) return { draft: null, error: 'Issue draft is missing body.', warnings: [] };
 
-  const workflowLabels = new Set<string>(CAMPAIGN_LABELS.map((label) => label.name));
-  const requestedLabels = stringArray(record.labels).filter((label) => !workflowLabels.has(label));
+  const workflowLabels = new Set<string>(CAMPAIGN_LABELS.map((label) => label.name.toLowerCase()));
+  const requestedLabels = stringArray(record.labels)
+    .map((label) => label.trim())
+    .filter((label) => label && !workflowLabels.has(label.toLowerCase()));
   const ally = allyForIssueRepo(workspaceRoot, repo);
-  const labels = uniqueStrings(['needs-triage', ...requestedLabels, ...(ally ? ['ally', ally.id] : [])]);
+  const generatedLabels = ['needs-triage', ...(ally ? ['ally', ally.id] : [])];
+  const labelValidation = validateIssueCreateLabels(repo, generatedLabels, requestedLabels);
+  if (labelValidation.error) return { draft: null, error: labelValidation.error, warnings: labelValidation.warnings };
+  const issueTypeValidation = validateIssueCreateType(repo, issueType || null);
+  const warnings = [...labelValidation.warnings, ...issueTypeValidation.warnings];
 
   return {
     draft: {
       repo,
       title,
       body,
-      labels,
-      issueType: issueType || null,
+      labels: labelValidation.labels,
+      issueType: issueTypeValidation.issueType,
       assignees,
       milestone,
     },
     error: null,
+    warnings,
   };
 }
 
 function parseIssueCreateDraft(workspaceRoot: string, draftPath: string) {
   if (!existsSync(draftPath)) {
-    return { draft: null, error: `Adapter did not write issue draft JSON to ${draftPath}.` };
+    return { draft: null, error: `Adapter did not write issue draft JSON to ${draftPath}.`, warnings: [] };
   }
 
   const raw = readFileSync(draftPath, 'utf8').trim();
-  if (!raw) return { draft: null, error: `Adapter left issue draft JSON empty at ${draftPath}.` };
+  if (!raw) return { draft: null, error: `Adapter left issue draft JSON empty at ${draftPath}.`, warnings: [] };
 
   try {
     return normalizeIssueCreateDraft(workspaceRoot, JSON.parse(raw));
@@ -357,6 +469,7 @@ function parseIssueCreateDraft(workspaceRoot: string, draftPath: string) {
     return {
       draft: null,
       error: `Could not parse issue draft JSON at ${draftPath}: ${error instanceof Error ? error.message : String(error)}`,
+      warnings: [],
     };
   }
 }
@@ -375,10 +488,43 @@ function createIssueCreateArtifact(
   return { artifact: { runDir, files: [inputPath, promptPath, draftPath] }, draftPath, promptPath };
 }
 
+function issueCreateMetadataText(workspaceRoot: string, options: IssueCreateOptions = {}) {
+  const repos = knownIssueRepos(workspaceRoot).filter((entry) => !options.repo || entry.repo === options.repo);
+  const issueTypesByOwner = new Map<string, ReturnType<typeof listOrgIssueTypeNames>>();
+  const lines: string[] = [];
+
+  for (const entry of repos) {
+    const labels = listRepoLabelNames(entry.repo);
+    const owner = repoParts(entry.repo)?.owner ?? null;
+    const issueTypes =
+      owner && issueTypesByOwner.has(owner)
+        ? issueTypesByOwner.get(owner)
+        : owner
+          ? listOrgIssueTypeNames(owner)
+          : null;
+    if (owner && issueTypes && !issueTypesByOwner.has(owner)) issueTypesByOwner.set(owner, issueTypes);
+
+    lines.push(`- ${entry.repo}`);
+    lines.push(`  Labels: ${labels.error ? `unavailable (${labels.error})` : labels.labels.join(', ') || 'none'}`);
+    lines.push(
+      `  Issue types: ${
+        !issueTypes
+          ? 'unavailable'
+          : issueTypes.error
+            ? `unavailable (${issueTypes.error})`
+            : issueTypes.issueTypes.join(', ') || 'none'
+      }`
+    );
+  }
+
+  return lines.length ? lines.join('\n') : '- No matching issue metadata found.';
+}
+
 function buildIssueCreatePrompt(workspaceRoot: string, draftPath: string, options: IssueCreateOptions = {}) {
   const repos = knownIssueRepos(workspaceRoot)
     .map((entry) => `- ${entry.repo} (${entry.kind}): ${entry.description}`)
     .join('\n');
+  const metadata = issueCreateMetadataText(workspaceRoot, options);
   const seed = [
     options.repo ? `Preferred repo: ${options.repo}` : null,
     options.title ? `Seed title: ${options.title}` : null,
@@ -406,6 +552,14 @@ function buildIssueCreatePrompt(workspaceRoot: string, draftPath: string, option
     '',
     'Available issue repos:',
     repos || '- No mapped issue repos found.',
+    '',
+    'Available GitHub metadata:',
+    metadata,
+    '',
+    'Metadata rules:',
+    '- Only use labels that are listed for the chosen repo. If no exact label exists, omit it.',
+    '- Only use issue types that are listed for the chosen repo owner. If no exact type exists, set issueType to null.',
+    '- Do not invent labels, milestones, assignees, or issue types.',
     '',
     'Minimum business scope to collect:',
     '- Who is affected and why this matters.',
@@ -814,7 +968,8 @@ function emptyIssueCreateResult(
   launched: boolean,
   launchError: string | null,
   draft: IssueCreateDraft | null,
-  draftError: string | null
+  draftError: string | null,
+  draftWarnings: string[] = []
 ): IssueCreateResult {
   return {
     prompt,
@@ -825,6 +980,7 @@ function emptyIssueCreateResult(
     launchError,
     draft,
     draftError,
+    draftWarnings,
     created: false,
     issue: null,
     url: null,
@@ -870,7 +1026,8 @@ export function runIssueCreate(workspaceRoot: string, options: IssueCreateOption
       false,
       null,
       directDraft.draft,
-      directDraft.error
+      directDraft.error,
+      directDraft.warnings
     );
     return options.confirm && result.draft ? createIssueFromDraft(workspaceRoot, result) : result;
   }
@@ -881,7 +1038,7 @@ export function runIssueCreate(workspaceRoot: string, options: IssueCreateOption
   }
 
   const launch = runInteractiveAdapter(workspaceRoot, prompt, { cwd: workspaceRoot });
-  const parsed = launch.launched && artifactContext ? parseIssueCreateDraft(workspaceRoot, artifactContext.draftPath) : { draft: null, error: null };
+  const parsed = launch.launched && artifactContext ? parseIssueCreateDraft(workspaceRoot, artifactContext.draftPath) : { draft: null, error: null, warnings: [] };
   const result = emptyIssueCreateResult(
     prompt,
     artifactContext?.artifact ?? null,
@@ -890,7 +1047,8 @@ export function runIssueCreate(workspaceRoot: string, options: IssueCreateOption
     launch.launched,
     launch.error,
     parsed.draft,
-    parsed.error
+    parsed.error,
+    parsed.warnings
   );
 
   return options.confirm && result.draft ? createIssueFromDraft(workspaceRoot, result) : result;
