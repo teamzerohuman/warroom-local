@@ -125,6 +125,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Issue start: launched');
       expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
+      expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#7 +battlefield-active; removed ready-to-engage');
       expect(lines).toContain('Development branch: ready warroom/7-build-the-selector from main');
       expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
       expect(lines).toContain('Development checkout: checked out');
@@ -144,6 +145,107 @@ describe('phase-1 CLI', () => {
         encoding: 'utf8',
       });
       expect(branch.stdout.trim()).toBe('warroom/7-build-the-selector');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('starts an ally issue in the mapped implementation owner repo from triage notes', async () => {
+    const root = makeDevFixture();
+    const backend = addBackendRepoFixture(root);
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeCrossRepoAllyIssueStartGhFixture(bin);
+    writeCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['2\n']);
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'next']);
+
+      expect(lines).toContain('Issues with Campaign status ready-to-engage: 2');
+      expect(lines.some((line) => line.startsWith('2. TeamFloPay/ally-clicktech#6 Omni Duplicate'))).toBe(true);
+      expect(lines).toContain('Starting TeamFloPay/ally-clicktech#6');
+      expect(lines).toContain('Issue start: launched');
+      expect(lines).toContain(`Adapter cwd: ${backend}`);
+      expect(lines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#6 -> battlefield-active');
+      expect(lines).toContain('Issue labels: updated TeamFloPay/ally-clicktech#6 +battlefield-active; removed ready-to-engage');
+      expect(lines).toContain('Development branch: ready warroom/6-omni-duplicate-paid-out-of-band-subscription-pay from main');
+      expect(lines.some((line) => line.startsWith('Development branch setup: created git fetch origin main && git switch -c warroom/6-omni-duplicate-paid-out-of-band-subscription-pay'))).toBe(true);
+      expect(lines).toContain('Development checkout: checked out');
+      expect(lines.some((line) => line.includes('Source issue: TeamFloPay/ally-clicktech#6'))).toBe(true);
+      expect(lines.some((line) => line.includes('Implementation repo: TeamFloPay/backend'))).toBe(true);
+      expect(lines.some((line) => line.includes('Backend Sergeant'))).toBe(true);
+      expect(lines.some((line) => line.includes('Closes TeamFloPay/ally-clicktech#6'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: handed off to LLM adapter on warroom/6-omni-duplicate-paid-out-of-band-subscription-pay. Campaign status updated to battlefield-active.');
+
+      const branch = spawnSync('git', ['branch', '--show-current'], {
+        cwd: backend,
+        encoding: 'utf8',
+      });
+      expect(branch.stdout.trim()).toBe('warroom/6-omni-duplicate-paid-out-of-band-subscription-pay');
+
+      const issueMetadata = spawnSync(
+        'git',
+        ['config', 'branch.warroom/6-omni-duplicate-paid-out-of-band-subscription-pay.warroom-issue'],
+        { cwd: backend, encoding: 'utf8' }
+      );
+      expect(issueMetadata.stdout.trim()).toBe('TeamFloPay/ally-clicktech#6');
+
+      const scopedLines: string[] = [];
+      const scopedProgram = buildProgram({ cwd: backend, output: (line) => scopedLines.push(line) });
+
+      await scopedProgram.parseAsync(['node', 'warroom', 'issue', 'next', '--no-select']);
+
+      expect(scopedLines[0]).toBe('Issues with Campaign status ready-to-engage for TeamFloPay/backend: 2');
+      expect(scopedLines.some((line) => line.includes('TeamFloPay/backend#639'))).toBe(true);
+      expect(scopedLines.some((line) => line.includes('TeamFloPay/ally-clicktech#6'))).toBe(true);
+
+      const prLines: string[] = [];
+      const prProgram = buildProgram({ cwd: backend, output: (line) => prLines.push(line) });
+
+      await prProgram.parseAsync(['node', 'warroom', 'pr', 'create']);
+
+      expect(prLines).toContain('PR create: preflight only');
+      expect(prLines).toContain('Repo: TeamFloPay/backend');
+      expect(prLines).toContain('Issue: TeamFloPay/ally-clicktech#6');
+      expect(prLines.some((line) => line.includes('Closes TeamFloPay/ally-clicktech#6'))).toBe(true);
+      expect(prLines).toContain('blocked: Repo has no origin remote for pushing the PR branch.');
+
+      const reviewLines: string[] = [];
+      const reviewProgram = buildProgram({ cwd: backend, output: (line) => reviewLines.push(line) });
+
+      await reviewProgram.parseAsync(['node', 'warroom', 'pr', 'review', '--pr', 'TeamFloPay/backend#660', '--confirm-status']);
+
+      expect(reviewLines).toContain('PR review: preflight only');
+      expect(reviewLines).toContain('Issue: TeamFloPay/ally-clicktech#6');
+      expect(reviewLines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#6 -> skirmish');
+      expect(reviewLines.some((line) => line.includes('Linked issue: TeamFloPay/ally-clicktech#6'))).toBe(true);
+
+      const mergeLines: string[] = [];
+      const mergeProgram = buildProgram({ cwd: backend, output: (line) => mergeLines.push(line) });
+
+      await mergeProgram.parseAsync([
+        'node',
+        'warroom',
+        'pr',
+        'merge',
+        '--pr',
+        'TeamFloPay/backend#660',
+        '--confirm-status',
+        '--post-summary',
+        '--confirm-summary',
+      ]);
+
+      expect(mergeLines).toContain('PR merge: preflight only');
+      expect(mergeLines).toContain('Issue: TeamFloPay/ally-clicktech#6');
+      expect(mergeLines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#6 -> victory');
+      expect(mergeLines).toContain('Summary issue: posted TeamFloPay/ally-clicktech#6 https://github.com/TeamFloPay/ally-clicktech/issues/6#issuecomment-2');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -1041,6 +1143,34 @@ describe('phase-1 CLI', () => {
     expect(lines).toContain('?? index.ts (unstaged)');
   });
 
+  it('infers the commit repo from War Room root using active branch metadata', async () => {
+    const { root, sdk } = makeCommitFixture();
+    writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
+    commitAll(sdk, 'fixture sdk');
+    const branch = spawnSync('git', ['switch', '-c', 'warroom/6-omni-duplicate-paid-out-of-band-subscription-pay'], {
+      cwd: sdk,
+      encoding: 'utf8',
+    });
+    if (branch.status !== 0) throw new Error(branch.stderr);
+    spawnSync('git', ['config', 'branch.warroom/6-omni-duplicate-paid-out-of-band-subscription-pay.warroom-issue', 'TeamFloPay/ally-clicktech#6'], {
+      cwd: sdk,
+    });
+    spawnSync('git', ['config', 'branch.warroom/6-omni-duplicate-paid-out-of-band-subscription-pay.warroom-implementation-repo', 'TeamFloPay/sdk'], {
+      cwd: sdk,
+    });
+    writeFileSync(path.join(sdk, 'index.ts'), 'export const value = 1;\n');
+
+    const lines: string[] = [];
+    const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+    await program.parseAsync(['node', 'warroom', 'commit', 'create']);
+
+    expect(lines).toContain('Commit create for sdk: preflight only');
+    expect(lines).toContain(`Path: ${sdk}`);
+    expect(lines.some((line) => line.startsWith('Branch: warroom/6-omni-duplicate-paid-out-of-band-subscription-pay@'))).toBe(true);
+    expect(lines).toContain('?? index.ts (unstaged)');
+  });
+
   it('prompts for a full commit after the commit dry run in an interactive terminal', async () => {
     const { sdk, sdkRemote } = makeCommitFixture();
     writeFileSync(path.join(sdk, 'index.ts'), 'export const value = 1;\n');
@@ -1709,6 +1839,36 @@ repos:
   return root;
 }
 
+function addBackendRepoFixture(root: string) {
+  const backend = path.resolve(root, '..', 'backend');
+  initGitRepo(backend);
+  writeFileSync(path.join(backend, 'package.json'), '{"packageManager":"npm@10.0.0"}\n');
+  commitAll(backend, 'fixture backend');
+
+  const manifestPath = path.join(root, 'repos.yaml');
+  writeFileSync(
+    manifestPath,
+    `${readFileSync(manifestPath, 'utf8')}
+  - id: backend
+    name: backend
+    github: TeamFloPay/backend
+    ssh_url: git@github.com:TeamFloPay/backend.git
+    local_path: maps/repos/backend
+    status: active
+    owner: backend
+    description: Backend services.
+    specialist:
+      name: Backend Sergeant
+      context:
+        frameworks: []
+        domains: []
+        resources: []
+`
+  );
+
+  return backend;
+}
+
 function makeCommitFixture() {
   const base = mkdtempSync(path.join(tmpdir(), 'warroom-commit-'));
   const root = path.join(base, 'warroom');
@@ -2218,6 +2378,182 @@ process.exit(1);
   chmodSync(ghPath, 0o755);
 }
 
+function writeCrossRepoAllyIssueStartGhFixture(bin: string) {
+  const ghPath = path.join(bin, 'gh');
+  writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+
+function json(value) {
+  process.stdout.write(JSON.stringify(value));
+}
+
+function valueFor(name) {
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (args[index] !== '-f' && args[index] !== '-F') continue;
+    const [key, value] = args[index + 1].split('=');
+    if (key === name) return value;
+  }
+}
+
+function optionValue(name) {
+  const index = args.indexOf(name);
+  return index === -1 ? undefined : args[index + 1];
+}
+
+if (args[0] === 'project' && args[1] === 'item-list') {
+  json({
+    items: [
+      {
+        id: 'PVTI_backend_ready',
+        title: 'Backend ready work',
+        status: 'ready-to-engage',
+        labels: ['ready-to-engage'],
+        content: {
+          repository: 'TeamFloPay/backend',
+          number: 639,
+          title: 'Remove product_provider_credentials in favor of gateway records',
+          type: 'Issue',
+          url: 'https://github.com/TeamFloPay/backend/issues/639'
+        }
+      },
+      {
+        id: 'PVTI_ally_ready',
+        title: 'Omni Duplicate "Paid out of band" Subscription Payment',
+        status: 'ready-to-engage',
+        labels: ['ready-to-engage', 'ally', 'clicktech'],
+        content: {
+          repository: 'TeamFloPay/ally-clicktech',
+          number: 6,
+          title: 'Omni Duplicate "Paid out of band" Subscription Payment',
+          type: 'Issue',
+          url: 'https://github.com/TeamFloPay/ally-clicktech/issues/6'
+        }
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'issue' && args[1] === 'view') {
+  json({
+    title: 'Omni Duplicate "Paid out of band" Subscription Payment',
+    body: 'Investigate the duplicate out-of-band payment and fix the underlying backend issue.',
+    url: 'https://github.com/TeamFloPay/ally-clicktech/issues/6',
+    labels: [{ name: 'ready-to-engage' }, { name: 'ally' }, { name: 'clicktech' }],
+    comments: [
+      {
+        author: { login: 'andyslack' },
+        createdAt: '2026-05-08T11:32:34Z',
+        body: [
+          '## Triage Notes',
+          '',
+          '**Owner repo:** \`TeamFloPay/backend\`',
+          '',
+          '**Implementation plan:** fix the backend hosted card subscription flow.'
+        ].join('\\n')
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'issue' && args[1] === 'edit') {
+  process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'list') {
+  json([]);
+  process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'view') {
+  const repo = optionValue('--repo');
+  const number = Number(args[2]);
+  if (repo === 'TeamFloPay/backend' && number === 660) {
+    json({
+      title: 'Fix hosted subscription duplicate first-period invoice',
+      body: 'Closes TeamFloPay/ally-clicktech#6\\n\\n## Summary\\n- Fixes the backend subscription flow.',
+      url: 'https://github.com/TeamFloPay/backend/pull/660',
+      mergeStateStatus: 'CLEAN',
+      mergeable: 'MERGEABLE',
+      reviewDecision: 'APPROVED',
+      headRefName: 'warroom/6-omni-duplicate-paid-out-of-band-subscription-pay',
+      baseRefName: 'main',
+      headRefOid: 'abc123abc123abc123abc123abc123abc123abc1',
+      isDraft: false,
+      files: [{ path: 'apps/api/src/stripe/subscriptions.ts', additions: 12, deletions: 4 }],
+      reviewRequests: [],
+      latestReviews: [{ state: 'APPROVED', author: { login: 'andyslack' }, submittedAt: '2026-05-08T12:00:00Z' }],
+      reviews: [],
+      statusCheckRollup: [{ name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }]
+    });
+    process.exit(0);
+  }
+}
+
+if (args[0] === 'project' && args[1] === 'view') {
+  json({ id: 'PVT_campaign', title: 'Campaign Map' });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'field-list') {
+  json({
+    fields: [
+      {
+        id: 'PVTSSF_status',
+        name: 'Status',
+        type: 'ProjectV2SingleSelectField',
+        options: [
+          { id: 'status_needs', name: 'needs-triage' },
+          { id: 'status_ready', name: 'ready-to-engage' },
+          { id: 'status_active', name: 'battlefield-active' },
+          { id: 'status_skirmish', name: 'skirmish' },
+          { id: 'status_blockaded', name: 'blockaded' },
+          { id: 'status_victory', name: 'victory' }
+        ]
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'item-edit') {
+  process.exit(0);
+}
+
+if (args[0] === 'api' && args[1] === 'graphql') {
+  const repo = valueFor('repo');
+  const number = Number(valueFor('number'));
+  const query = valueFor('query') || '';
+  if (query.includes('pullRequest')) {
+    json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } });
+    process.exit(0);
+  }
+  if (repo === 'ally-clicktech' && number === 6) {
+    json({ data: { repository: { issue: { closedByPullRequestsReferences: { nodes: [] }, timelineItems: { nodes: [] } } } } });
+    process.exit(0);
+  }
+}
+
+if (args[0] === 'pr' && args[1] === 'comment') {
+  process.stdout.write('https://github.com/TeamFloPay/backend/pull/660#issuecomment-1');
+  process.exit(0);
+}
+
+if (args[0] === 'issue' && args[1] === 'comment') {
+  process.stdout.write('https://github.com/TeamFloPay/ally-clicktech/issues/6#issuecomment-2');
+  process.exit(0);
+}
+
+console.error('Unexpected gh fixture call: ' + args.join(' '));
+process.exit(1);
+`
+  );
+  chmodSync(ghPath, 0o755);
+}
+
 function writeGhFixture(bin: string) {
   const ghPath = path.join(bin, 'gh');
   writeFileSync(
@@ -2431,6 +2767,7 @@ if (args[0] === 'issue' && args[1] === 'view') {
     title: 'Build the selector',
     body: 'Allow operators to pick a ready issue and start implementation.',
     url: 'https://github.com/TeamFloPay/sdk/issues/7',
+    labels: [{ name: 'ready-to-engage' }],
     comments: [
       {
         author: { login: 'andrewslack' },
@@ -2439,6 +2776,36 @@ if (args[0] === 'issue' && args[1] === 'view') {
       }
     ]
   });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'view') {
+  json({ id: 'PVT_campaign', title: 'Campaign Map' });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'field-list') {
+  json({
+    fields: [
+      {
+        id: 'PVTSSF_status',
+        name: 'Status',
+        type: 'ProjectV2SingleSelectField',
+        options: [
+          { id: 'status_needs', name: 'needs-triage' },
+          { id: 'status_ready', name: 'ready-to-engage' },
+          { id: 'status_active', name: 'battlefield-active' },
+          { id: 'status_skirmish', name: 'skirmish' },
+          { id: 'status_blockaded', name: 'blockaded' },
+          { id: 'status_victory', name: 'victory' }
+        ]
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'item-edit') {
   process.exit(0);
 }
 
@@ -2797,6 +3164,36 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   }
 
   json({ data: { repository: { issue: { closedByPullRequestsReferences: { nodes: [] }, timelineItems: { nodes: [] } } } } });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'view') {
+  json({ id: 'PVT_campaign', title: 'Campaign Map' });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'field-list') {
+  json({
+    fields: [
+      {
+        id: 'PVTSSF_status',
+        name: 'Status',
+        type: 'ProjectV2SingleSelectField',
+        options: [
+          { id: 'status_needs', name: 'needs-triage' },
+          { id: 'status_ready', name: 'ready-to-engage' },
+          { id: 'status_active', name: 'battlefield-active' },
+          { id: 'status_skirmish', name: 'skirmish' },
+          { id: 'status_blockaded', name: 'blockaded' },
+          { id: 'status_victory', name: 'victory' }
+        ]
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'item-edit') {
   process.exit(0);
 }
 

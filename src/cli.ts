@@ -27,6 +27,7 @@ import {
 import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js';
 import { runMapsStudy } from './commands/maps-study.js';
 import {
+  inferIssueRefForCurrentBranch,
   inferPrRefForCurrentBranch,
   runIssueStart,
   runPrCreate,
@@ -150,6 +151,11 @@ async function promptIssueSelection(output: Output, input: Input, issues: IssueS
 
 function prReviewRef(pr: PrReviewQueueResult['prs'][number]) {
   return `${pr.repo}#${pr.number}`;
+}
+
+function primaryIssueRef(pr: PrReviewQueueResult['prs'][number]) {
+  const issue = pr.issues[0];
+  return issue ? `${issue.repo}#${issue.number}` : undefined;
 }
 
 async function promptPrReviewSelection(output: Output, input: Input, prs: PrReviewQueueResult['prs']) {
@@ -367,6 +373,7 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   const state = result.launchError ? 'blocked' : result.launched ? 'launched' : result.action === 'issue-start' ? 'dry run' : 'preflight only';
   const label = result.action === 'issue-start' ? 'Issue start' : `PR ${result.action}`;
   output(`${label}: ${state}`);
+  if (result.action !== 'issue-start' && result.issue) output(`Issue: ${result.issue}`);
   if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
   if (result.adapterCwd) output(`Adapter cwd: ${result.adapterCwd}`);
   if (result.launchError) output(`Adapter error: ${result.launchError}`);
@@ -381,8 +388,9 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   }
   if (result.developmentBranch) {
     const branch = result.developmentBranch;
+    const branchSetupLabel = branch.command.startsWith('gh issue develop') ? 'Development branch link' : 'Development branch setup';
     output(`Development branch: ${branch.applied ? 'ready' : 'planned'} ${branch.branch} from ${branch.base}`);
-    output(`Development branch link: ${branch.linked ? 'created' : 'planned'} ${branch.command}`);
+    output(`${branchSetupLabel}: ${branch.applied ? 'created' : 'planned'} ${branch.command}`);
     output(
       `Development checkout: ${branch.checkoutRequired ? branch.checkedOut ? 'checked out' : branch.path ? `not checked out (${branch.path})` : 'missing checkout' : 'not checked out'}`
     );
@@ -460,6 +468,13 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
+  if (result.labelUpdate) {
+    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
+    output(
+      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
+    );
+    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
+  }
   output(result.prompt);
   const outcome = issueStartOutcome(result) ?? prReviewOutcome(result);
   if (outcome) output(outcome);
@@ -483,6 +498,13 @@ function printPrCreate(output: Output, result: PrCreateResult) {
   for (const blocker of result.blocked) output(`blocked: ${blocker}`);
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
+  }
+  if (result.labelUpdate) {
+    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
+    output(
+      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
+    );
+    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
   }
   output(result.body);
   if (result.created && result.url) {
@@ -1213,7 +1235,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
           const review = await runPrReview(workspaceRoot, {
             pr: inferredPr,
-            issue: opts.issue,
+            issue: opts.issue ?? inferIssueRefForCurrentBranch(workspaceRoot, invocationCwd) ?? undefined,
             dryRun: opts.dryRun === true ? true : !launch,
             checkInMinutes: opts.checkInMinutes,
             confirmStatus: opts.confirmStatus,
@@ -1235,7 +1257,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         output(`Starting PR review for ${selectedPr}`);
         const review = await runPrReview(workspaceRoot, {
           pr: selectedPr,
-          issue: opts.issue,
+          issue: opts.issue ?? primaryIssueRef(selected),
           dryRun: false,
           checkInMinutes: opts.checkInMinutes,
           confirmStatus: opts.confirmStatus,
@@ -1291,6 +1313,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       json?: boolean;
     }) => {
       const resolvedPr = opts.pr ?? inferPrRefForCurrentBranch(workspaceRoot, invocationCwd);
+      const resolvedIssue = opts.issue ?? inferIssueRefForCurrentBranch(workspaceRoot, invocationCwd) ?? undefined;
       if (!opts.pr && !opts.json) output(`Resolved current branch PR: ${resolvedPr}`);
       const liveE2EOutput = opts.json
         ? {}
@@ -1302,7 +1325,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
       const result = await runPrMerge(workspaceRoot, {
         pr: resolvedPr,
-        issue: opts.issue,
+        issue: resolvedIssue,
         confirm: opts.confirm,
         confirmStatus: opts.confirmStatus,
         summary: opts.summary,
@@ -1351,7 +1374,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           );
           confirmedResult = await runPrMerge(workspaceRoot, {
             pr: resolvedPr,
-            issue: opts.issue,
+            issue: resolvedIssue,
             confirm: true,
             skipMergeE2E,
             allowUnresolvedReviewThreads,
@@ -1374,7 +1397,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
       await promptPrMergeFollowUps(workspaceRoot, output, input, {
         pr: resolvedPr,
-        issue: opts.issue,
+        issue: confirmedResult.issue ?? resolvedIssue,
         summary: opts.summary,
         confirmSummary: opts.confirmSummary,
         confirmCleanup: opts.confirmCleanup,
@@ -1385,7 +1408,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
   commit
     .command('create')
     .description('Inspect a child repo and optionally create a conventional commit.')
-    .option('--repo <id>', 'Repo id from repos.yaml. Defaults to the current mapped child repo when run inside one.')
+    .option('--repo <id>', 'Repo id from repos.yaml. Defaults to the current mapped child repo or single active mapped development branch.')
     .option('--message <message>', 'Commit message to use.')
     .option('--validate <command>', 'Validation command to run from the target repo before commit. Repeatable.', collect, [])
     .option('--write-artifact', 'Write input/result/summary artifacts under .warroom/runs.')

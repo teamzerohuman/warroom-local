@@ -14,9 +14,10 @@ import {
   type CampaignStatusSetResult,
 } from '../lib/campaign.js';
 import { getAdapterInvocation, runAdapter } from '../lib/env.js';
+import { closingIssueRefFromText, ownerRepoFromText } from '../lib/issue-links.js';
 import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
-import { parseIssueRef, type IssueRef } from './issues.js';
+import { parseIssueRef, setIssueWorkflowLabel, type IssueLabelUpdateResult, type IssueRef } from './issues.js';
 
 export type PrTextResult = {
   source: 'adapter' | 'fallback' | 'manual';
@@ -176,7 +177,9 @@ export type PrPlanResult = {
   launched: boolean;
   adapterCommand: string | null;
   action: 'issue-start' | 'review' | 'merge';
+  issue?: string | null;
   campaignStatus: CampaignStatusSetResult | null;
+  labelUpdate?: IssueLabelUpdateResult | null;
   developmentBranch?: DevelopmentBranchResult;
   mergeReadiness?: MergeReadiness;
   summary?: string;
@@ -215,6 +218,7 @@ export type PrCreateResult = {
   url: string | null;
   blocked: string[];
   campaignStatus: CampaignStatusSetResult | null;
+  labelUpdate: IssueLabelUpdateResult | null;
   prText: PrTextResult;
   artifact?: RunArtifact;
 };
@@ -395,27 +399,33 @@ function createDevelopmentBranchResult(
   title: string | undefined,
   base: string,
   apply: boolean,
-  checkoutRequired: boolean
+  checkoutRequired: boolean,
+  implementationRepo = ref.repo
 ): DevelopmentBranchResult {
   const branch = featureBranchForIssue(ref, title);
-  const repoEntry = repoEntryForGitHub(workspaceRoot, ref.repo);
-  const commandArgs = [
-    'issue',
-    'develop',
-    String(ref.number),
-    '--repo',
-    ref.repo,
-    '--base',
-    base,
-    '--name',
-    branch,
-  ];
-  if (checkoutRequired) commandArgs.push('--checkout');
-  const command = ['gh', ...commandArgs].join(' ');
+  const repoEntry = repoEntryForGitHub(workspaceRoot, implementationRepo);
+  const crossRepo = implementationRepo !== ref.repo;
+  const commandArgs = crossRepo
+    ? []
+    : [
+        'issue',
+        'develop',
+        String(ref.number),
+        '--repo',
+        ref.repo,
+        '--base',
+        base,
+        '--name',
+        branch,
+      ];
+  if (!crossRepo && checkoutRequired) commandArgs.push('--checkout');
+  const command = crossRepo
+    ? `git fetch origin ${shellQuote(base)} && git switch -c ${shellQuote(branch)} origin/${shellQuote(base)}`
+    : ['gh', ...commandArgs].join(' ');
   const blocked: string[] = [];
 
   if (!repoEntry) {
-    blocked.push(`repos.yaml does not define a mapped checkout for ${ref.repo}.`);
+    blocked.push(`repos.yaml does not define a mapped checkout for ${implementationRepo}.`);
   }
 
   const repo = repoEntry ? getRepoHealth(workspaceRoot, repoEntry) : null;
@@ -426,7 +436,7 @@ function createDevelopmentBranchResult(
 
   if (!apply || blocked.length > 0 || !repo?.checkedOut) {
     return {
-      repo: ref.repo,
+      repo: implementationRepo,
       path: repo?.resolvedPath ?? null,
       branch,
       base,
@@ -438,6 +448,97 @@ function createDevelopmentBranchResult(
       blocked,
       output: null,
       error: blocked.length > 0 ? blocked.join(' ') : null,
+    };
+  }
+
+  if (crossRepo) {
+    let output: string | null = null;
+    if (branchExists(repo.resolvedPath, branch)) {
+      const switched = runGit(repo.resolvedPath, ['switch', branch]);
+      output = `${switched.stdout ?? ''}${switched.stderr ?? ''}`.trim() || null;
+      if (switched.status !== 0) {
+        return {
+          repo: implementationRepo,
+          path: repo.resolvedPath,
+          branch,
+          base,
+          command,
+          checkoutRequired,
+          applied: false,
+          linked: false,
+          checkedOut: false,
+          blocked: [`Development branch checkout failed with exit ${switched.status ?? 'unknown'}.`],
+          output,
+          error: output || `Development branch checkout failed with exit ${switched.status ?? 'unknown'}.`,
+        };
+      }
+    } else {
+      const fetch = runGit(repo.resolvedPath, ['fetch', 'origin', base]);
+      const startPoint = fetch.status === 0 ? `origin/${base}` : base;
+      const created = runGit(repo.resolvedPath, ['switch', '-c', branch, startPoint]);
+      output = `${fetch.stdout ?? ''}${fetch.stderr ?? ''}${created.stdout ?? ''}${created.stderr ?? ''}`.trim() || null;
+      if (created.status !== 0) {
+        return {
+          repo: implementationRepo,
+          path: repo.resolvedPath,
+          branch,
+          base,
+          command,
+          checkoutRequired,
+          applied: false,
+          linked: false,
+          checkedOut: false,
+          blocked: [`Development branch setup failed with exit ${created.status ?? 'unknown'}.`],
+          output,
+          error: output || `Development branch setup failed with exit ${created.status ?? 'unknown'}.`,
+        };
+      }
+    }
+
+    const issueMetadata = runGit(repo.resolvedPath, ['config', `branch.${branch}.warroom-issue`, `${ref.repo}#${ref.number}`]);
+    const implementationMetadata = runGit(repo.resolvedPath, ['config', `branch.${branch}.warroom-implementation-repo`, implementationRepo]);
+    output =
+      [
+        output,
+        issueMetadata.stdout,
+        issueMetadata.stderr,
+        implementationMetadata.stdout,
+        implementationMetadata.stderr,
+      ]
+        .filter(Boolean)
+        .join('\n') || null;
+    if (issueMetadata.status !== 0 || implementationMetadata.status !== 0) {
+      return {
+        repo: implementationRepo,
+        path: repo.resolvedPath,
+        branch,
+        base,
+        command,
+        checkoutRequired,
+        applied: false,
+        linked: false,
+        checkedOut: false,
+        blocked: ['Development branch metadata setup failed.'],
+        output,
+        error: output || 'Development branch metadata setup failed.',
+      };
+    }
+
+    const currentBranch = checkoutRequired ? runGit(repo.resolvedPath, ['branch', '--show-current']) : null;
+    const checkedOut = currentBranch ? currentBranch.status === 0 && currentBranch.stdout === branch : false;
+    return {
+      repo: implementationRepo,
+      path: repo.resolvedPath,
+      branch,
+      base,
+      command,
+      checkoutRequired,
+      applied: true,
+      linked: false,
+      checkedOut,
+      blocked: !checkoutRequired || checkedOut ? [] : [`Created development branch, but local checkout is on ${currentBranch?.stdout || 'unknown'}.`],
+      output,
+      error: !checkoutRequired || checkedOut ? null : `Expected local checkout on ${branch}, got ${currentBranch?.stdout || 'unknown'}.`,
     };
   }
 
@@ -459,6 +560,9 @@ function createDevelopmentBranchResult(
       error: output || `Development branch setup failed with exit ${result.status ?? 'unknown'}.`,
     };
   }
+
+  runGit(repo.resolvedPath, ['config', `branch.${branch}.warroom-issue`, `${ref.repo}#${ref.number}`]);
+  runGit(repo.resolvedPath, ['config', `branch.${branch}.warroom-implementation-repo`, implementationRepo]);
 
   const currentBranch = checkoutRequired ? runGit(repo.resolvedPath, ['branch', '--show-current']) : null;
   const checkedOut = currentBranch ? currentBranch.status === 0 && currentBranch.stdout === branch : false;
@@ -1258,9 +1362,24 @@ function repoHealthForCurrentPath(workspaceRoot: string, currentPath: string) {
     .sort((left, right) => right.resolvedPath.length - left.resolvedPath.length)[0] ?? null;
 }
 
-function currentBranchIssueRef(repo: string, branch: string) {
+function configuredBranchIssueRef(repoPath: string, branch: string) {
+  const configured = gitOutput(repoPath, ['config', `branch.${branch}.warroom-issue`]);
+  if (configured?.match(/^[^#]+#\d+$/)) return configured;
+  return null;
+}
+
+function currentBranchIssueRef(repo: string, branch: string, repoPath?: string) {
+  const configured = repoPath ? configuredBranchIssueRef(repoPath, branch) : null;
+  if (configured) return configured;
+
   const match = branch.match(/^warroom\/(\d+)-/);
   return match ? `${repo}#${match[1]}` : null;
+}
+
+export function inferIssueRefForCurrentBranch(workspaceRoot: string, currentPath: string) {
+  const repo = repoHealthForCurrentPath(workspaceRoot, currentPath);
+  if (!repo?.branch) return null;
+  return configuredBranchIssueRef(repo.resolvedPath, repo.branch);
 }
 
 function gitOutput(repoPath: string, args: string[]) {
@@ -1737,7 +1856,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
   if (!branch) throw new Error(`Could not infer current branch for ${repo.github}. Pass --branch <name>.`);
 
   const base = defaultPrBase(workspaceRoot, repo.resolvedPath, branch, options.base);
-  const issueRef = options.issue ?? currentBranchIssueRef(repo.github, branch);
+  const issueRef = options.issue ?? currentBranchIssueRef(repo.github, branch, repo.resolvedPath);
   const parsedIssue = issueRef ? parseIssueRef(issueRef) : null;
   const issue = issueRef
     ? ghJson<{ title?: string; body?: string; url?: string }>(
@@ -1853,6 +1972,9 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
   const campaignStatus = issueRef
     ? setCampaignStatus(issueRef, 'skirmish', { confirm: Boolean(options.confirm && options.confirmStatus && created) })
     : null;
+  const labelUpdate = issueRef
+    ? setIssueWorkflowLabel(issueRef, 'skirmish', Boolean(options.confirm && options.confirmStatus && created))
+    : null;
   const result: Omit<PrCreateResult, 'artifact'> = {
     action: 'create',
     repo: repo.github,
@@ -1870,6 +1992,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     url,
     blocked,
     campaignStatus,
+    labelUpdate,
     prText,
   };
 
@@ -2874,6 +2997,20 @@ function planLocalCleanup(
   };
 }
 
+function inferImplementationRepo(
+  workspaceRoot: string,
+  issueRepo: string,
+  issue: { body?: string; comments?: Array<{ body?: string }> }
+) {
+  const candidates = [
+    ...(issue.comments ?? []).slice().reverse().map((comment) => ownerRepoFromText(comment.body)),
+    ownerRepoFromText(issue.body),
+  ].filter((repo): repo is string => Boolean(repo));
+
+  const mapped = candidates.find((repo) => repoEntryForGitHub(workspaceRoot, repo));
+  return mapped ?? candidates[0] ?? issueRepo;
+}
+
 export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlanResult {
   if (!options.issue) throw new Error('warroom issue next requires --issue owner/repo#number for direct starts.');
   const ref = parseIssueRef(options.issue);
@@ -2888,8 +3025,10 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
   );
   const title = issue.title ?? options.issueTitle ?? 'unknown';
   const base = options.base ?? 'main';
+  const implementationRepo = inferImplementationRepo(workspaceRoot, ref.repo, issue);
+  const crossRepoImplementation = implementationRepo !== ref.repo;
   const featureBranch = featureBranchForIssue(ref, title);
-  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
+  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, implementationRepo);
   const adapterInvocation = getAdapterInvocation(workspaceRoot, adapterCwd);
   const developmentBranch = createDevelopmentBranchResult(
     workspaceRoot,
@@ -2897,7 +3036,8 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     title,
     base,
     options.dryRun === false,
-    true
+    true,
+    implementationRepo
   );
   const issueCommentRows = (issue.comments ?? []).map((comment, index) => {
     const author = comment.author?.login ?? 'unknown';
@@ -2909,19 +3049,35 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     '',
     `Title: ${title}`,
     `URL: ${issue.url ?? options.issueUrl ?? `https://github.com/${ref.repo}/issues/${ref.number}`}`,
+    crossRepoImplementation ? `Source issue: ${options.issue}` : null,
+    `Implementation repo: ${implementationRepo}`,
     `Base branch: ${base} (use stage only as the second target option after validation)`,
     `Feature branch: ${featureBranch}`,
-    `Development branch link: ${developmentBranch.applied ? 'created' : 'planned'} with \`${developmentBranch.command}\``,
+    crossRepoImplementation
+      ? `Development branch setup: ${developmentBranch.applied ? 'created' : 'planned'} in ${implementationRepo} with \`${developmentBranch.command}\``
+      : `Development branch link: ${developmentBranch.applied ? 'created' : 'planned'} with \`${developmentBranch.command}\``,
     '',
-    buildSpecialistContext(workspaceRoot, ref.repo),
+    buildSpecialistContext(workspaceRoot, implementationRepo),
+    crossRepoImplementation
+      ? [
+          '',
+          `Source issue context for ${options.issue}:`,
+          buildSpecialistContext(workspaceRoot, ref.repo),
+          '- Keep the client-facing issue in the ally repo; implement code only in the implementation repo above.',
+        ].join('\n')
+      : null,
     '',
     'Mission:',
     '- Implement the issue now. Do not stop after writing a plan, preflight, analysis note, or handoff markdown.',
-    `- Use the already prepared GitHub-linked development branch ${featureBranch}.`,
-    `- Before editing, verify the current branch. War Room should have checked this checkout out to ${featureBranch}; if it is not already on that branch, run \`git fetch origin ${featureBranch}\`, then \`git switch ${featureBranch}\` or \`git switch -c ${featureBranch} --track origin/${featureBranch}\` before editing.`,
+    crossRepoImplementation
+      ? `- Use the already prepared development branch ${featureBranch} in ${implementationRepo}. It is intentionally not created in the ally issue repo.`
+      : `- Use the already prepared GitHub-linked development branch ${featureBranch}.`,
+    crossRepoImplementation
+      ? `- Before editing, verify the current branch. War Room should have checked the ${implementationRepo} checkout out to ${featureBranch}; if it is not already on that branch, run \`git switch ${featureBranch}\` before editing.`
+      : `- Before editing, verify the current branch. War Room should have checked this checkout out to ${featureBranch}; if it is not already on that branch, run \`git fetch origin ${featureBranch}\`, then \`git switch ${featureBranch}\` or \`git switch -c ${featureBranch} --track origin/${featureBranch}\` before editing.`,
     '- Read and follow the repository AGENTS.md plus referenced development/testing instructions before editing.',
     '- Use the existing issue body and GitHub discussion as the accepted triage context.',
-    '- Make the required code, test, and product documentation changes in this owning child repo.',
+    `- Make the required code, test, and product documentation changes in ${implementationRepo}.`,
     '- Do not create standalone preflight, plan, or analysis markdown files unless the issue specifically asks for product documentation.',
     '- Run the most relevant validation commands for the changed surface; if the repo defines a full go/check command, run it before finishing when feasible.',
     '- Commit the implementation on the feature branch after validation passes. If validation cannot pass, leave the code changes in place and explain the blocker.',
@@ -2933,7 +3089,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     '',
     'Complete GitHub discussion and triage comments:',
     issueComments,
-  ].join('\n');
+  ].filter((line): line is string => line !== null).join('\n');
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'issue-start', {
         'prompt.md': prompt,
@@ -2954,7 +3110,9 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       launched: false,
       adapterCommand,
       action: 'issue-start',
+      issue: options.issue,
       campaignStatus: null,
+      labelUpdate: null,
       developmentBranch,
       contextSummary: { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 },
       adapterCwd,
@@ -2962,10 +3120,27 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     };
   }
   const campaignStatus = setCampaignStatus(options.issue, 'battlefield-active', { confirm: options.confirmStatus });
+  const labelUpdate = setIssueWorkflowLabel(options.issue, 'battlefield-active', options.confirmStatus === true);
 
   const contextSummary = { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 };
   if (options.dryRun !== false) {
-    return { prompt, artifact, launched: false, adapterCommand, action: 'issue-start', campaignStatus, developmentBranch, contextSummary, adapterCwd };
+    return { prompt, artifact, launched: false, adapterCommand, action: 'issue-start', issue: options.issue, campaignStatus, labelUpdate, developmentBranch, contextSummary, adapterCwd };
+  }
+  if (labelUpdate.error) {
+    return {
+      prompt,
+      artifact,
+      launched: false,
+      adapterCommand,
+      action: 'issue-start',
+      issue: options.issue,
+      campaignStatus,
+      labelUpdate,
+      developmentBranch,
+      contextSummary,
+      adapterCwd,
+      launchError: labelUpdate.error,
+    };
   }
   const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
   return {
@@ -2974,7 +3149,9 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     launched: launch.launched,
     adapterCommand: launch.invocation.display,
     action: 'issue-start',
+    issue: options.issue,
     campaignStatus,
+    labelUpdate,
     developmentBranch,
     contextSummary,
     adapterCwd,
@@ -3004,7 +3181,8 @@ function buildCodeRabbitThreadContext(threads: MergeReadiness['unresolvedReviewT
 function buildCodeRabbitPrReviewPrompt(
   prUrl: string,
   ref: { repo: string; number: number },
-  threads: MergeReadiness['unresolvedReviewThreads']
+  threads: MergeReadiness['unresolvedReviewThreads'],
+  issueRef: string | null = null
 ) {
   return `Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)
  feedback for the latest commit on the [@github](plugin://github@openai-curated)
@@ -3012,6 +3190,7 @@ function buildCodeRabbitPrReviewPrompt(
 
 Repository: ${ref.repo}
 PR number: ${ref.number}
+Linked issue: ${issueRef ?? 'none inferred'}
 
 Outstanding CodeRabbit review threads captured by War Room:
 ${buildCodeRabbitThreadContext(threads)}
@@ -3071,7 +3250,7 @@ async function runCodeRabbitPrReviewLoop(
     for (const thread of threadsForPrompt) {
       if (thread.threadId) expectedReplyThreads.set(thread.threadId, thread);
     }
-    const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, threadsForPrompt);
+    const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, threadsForPrompt, options.issue ?? null);
     options.reviewStatus?.(`PR review loop ${index}: launching adapter for ${ref.repo}#${ref.number}.`);
     const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
     adapterCommand = launch.invocation.display;
@@ -3183,21 +3362,24 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
   if (!options.pr) throw new Error('warroom pr review requires --pr owner/repo#number.');
   const ref = parsePrRef(options.pr);
   const pr = prReviewSnapshot(ref);
+  const issueRef = options.issue ?? closingIssueRefFromText(ref.repo, pr.body);
+  const resolvedOptions = { ...options, issue: issueRef ?? undefined };
   const prUrl = pr.url ?? `https://github.com/${ref.repo}/pull/${ref.number}`;
   const initialCodeRabbitThreads = listOutstandingCodeRabbitThreads(ref);
-  const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, initialCodeRabbitThreads);
+  const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, initialCodeRabbitThreads, issueRef);
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-review', {
         'prompt.md': prompt,
-        'input.json': JSON.stringify(options, null, 2),
+        'input.json': JSON.stringify(resolvedOptions, null, 2),
         'pr.json': JSON.stringify(pr, null, 2),
       })
     : null;
   const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
   const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd).display;
-  const campaignStatus = options.issue
-    ? setCampaignStatus(options.issue, 'skirmish', { confirm: options.confirmStatus })
+  const campaignStatus = issueRef
+    ? setCampaignStatus(issueRef, 'skirmish', { confirm: options.confirmStatus })
     : null;
+  const labelUpdate = issueRef ? setIssueWorkflowLabel(issueRef, 'skirmish', options.confirmStatus === true) : null;
   const contextSummary = {
     promptCharacters: prompt.length,
     comments: initialCodeRabbitThreads.length,
@@ -3211,21 +3393,25 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
       launched: false,
       adapterCommand,
       action: 'review',
+      issue: issueRef,
       campaignStatus,
+      labelUpdate,
       contextSummary,
       adapterCwd,
       prReviewLoop: { status: 'planned', completed: false, iterations: [], blocked: [], error: null },
     };
   }
 
-  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prUrl, adapterCwd, pr, options);
+  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prUrl, adapterCwd, pr, resolvedOptions);
   return {
     prompt,
     artifact,
     launched: loop.launched,
     adapterCommand: loop.adapterCommand ?? adapterCommand,
     action: 'review',
+    issue: issueRef,
     campaignStatus,
+    labelUpdate,
     contextSummary,
     adapterCwd,
     prReviewLoop: loop.loop,
@@ -3271,6 +3457,8 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     ],
     {}
   );
+  const issueRef = options.issue ?? closingIssueRefFromText(ref.repo, pr.body);
+  const resolvedOptions = { ...options, issue: issueRef ?? undefined };
   const reviewThreads = listPullRequestReviewThreads(ref);
   const readiness = buildMergeReadiness(pr, reviewThreads, {
     allowUnresolvedReviewThreads: options.allowUnresolvedReviewThreads,
@@ -3281,7 +3469,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
   const mergeChangelogRequirementResult = mergeChangelogRequirement(workspaceRoot, ref.repo);
   let mergeE2E = createMergeE2EPlan(workspaceRoot, mergePlaywright);
   let mergeChangelog = createMergeChangelogPlan(workspaceRoot, ref.repo, targetBase, mergeChangelogRequirementResult);
-  const summary = buildVictorySummary(options.pr, options.issue, pr, readiness, options.summary);
+  const summary = buildVictorySummary(options.pr, issueRef ?? undefined, pr, readiness, options.summary);
   const blockerDetails = readiness.details.length
     ? readiness.details
         .map((detail) => [
@@ -3369,22 +3557,25 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     );
     if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);
     merged = true;
-    mergeChangelog = await runMergeChangelog(workspaceRoot, mergeChangelog, options, pr);
+    mergeChangelog = await runMergeChangelog(workspaceRoot, mergeChangelog, resolvedOptions, pr);
   }
 
   const completionReadiness =
     mergeChangelog.required && mergeChangelog.status === 'failed'
       ? { ...readiness, blocked: [...readiness.blocked, 'Required CHANGELOG.md update failed.'] }
       : readiness;
-  const summaryPosts = buildSummaryPostPlan(options, summary, completionReadiness);
+  const summaryPosts = buildSummaryPostPlan(resolvedOptions, summary, completionReadiness);
   const localCleanup = planLocalCleanup(workspaceRoot, ref.repo, pr.headRefName, pr.baseRefName, options);
-  const campaignStatus = options.issue
-    ? setCampaignStatus(options.issue, 'victory', { confirm: options.confirmStatus && completionReadiness.blocked.length === 0 })
+  const campaignStatus = issueRef
+    ? setCampaignStatus(issueRef, 'victory', { confirm: options.confirmStatus && completionReadiness.blocked.length === 0 })
+    : null;
+  const labelUpdate = issueRef
+    ? setIssueWorkflowLabel(issueRef, 'victory', options.confirmStatus === true && completionReadiness.blocked.length === 0)
     : null;
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-merge', {
         'prompt.md': prompt,
-        'input.json': JSON.stringify(options, null, 2),
+        'input.json': JSON.stringify(resolvedOptions, null, 2),
         'pr.json': JSON.stringify(pr, null, 2),
         'readiness.json': JSON.stringify(readiness, null, 2),
         'merge-e2e.json': JSON.stringify(mergeE2E, null, 2),
@@ -3401,7 +3592,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     launched: false,
     adapterCommand: null,
     action: 'merge',
+    issue: issueRef,
     campaignStatus,
+    labelUpdate,
     mergeReadiness: readiness,
     mergeE2E,
     mergeChangelog,

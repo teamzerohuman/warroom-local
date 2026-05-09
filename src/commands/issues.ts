@@ -4,6 +4,7 @@ import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { resolveAllyIssueRepo } from '../lib/allies.js';
 import { CAMPAIGN_LABELS, listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusName, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getInteractiveAdapterInvocation, runInteractiveAdapter } from '../lib/env.js';
+import { ownerRepoFromText } from '../lib/issue-links.js';
 import { getRepoHealth, loadRepoManifest } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 
@@ -303,12 +304,29 @@ function repoWorkspaceForGitHub(workspaceRoot: string, githubRepo: string) {
   return allyIssueRepo?.issueRepoCheckedOut ? allyIssueRepo.issueRepoPath : workspaceRoot;
 }
 
+function implementationRepoForIssue(workspaceRoot: string, issue: IssueRef) {
+  const context = issueContext(issue);
+  const comments = issueComments(issue).comments;
+  const candidates = [
+    ...comments.slice().reverse().map((comment) => ownerRepoFromText(comment.body)),
+    ownerRepoFromText(context.body),
+  ].filter((repo): repo is string => Boolean(repo));
+  const mapped = candidates.find((repo) => repoEntryForGitHub(workspaceRoot, repo));
+  return mapped ?? candidates[0] ?? issue.repo;
+}
+
+function issueMatchesRepoFilter(workspaceRoot: string, issue: IssueSummary, repoFilter: string | null) {
+  if (!repoFilter) return true;
+  if (issue.repo === repoFilter) return true;
+  return implementationRepoForIssue(workspaceRoot, issue) === repoFilter;
+}
+
 export function runIssueNext(workspaceRoot: string, options: IssueNextOptions | string = {}) {
   const label = typeof options === 'string' ? options : options.label ?? 'ready-to-engage';
   const currentRepo = typeof options === 'string' || options.allRepos ? null : repoForCurrentPath(workspaceRoot, options.currentPath);
   const repoFilter = currentRepo?.github ?? null;
   const campaignIssues = listIssuesByCampaignStatus('ready-to-engage');
-  const issues = campaignIssues.filter((issue) => !repoFilter || issue.repo === repoFilter);
+  const issues = campaignIssues.filter((issue) => issueMatchesRepoFilter(workspaceRoot, issue, repoFilter));
   if (campaignIssues.length > 0) return { status: 'ready-to-engage', repo: repoFilter ?? undefined, source: 'campaign' as const, issues };
   return listIssuesByLabel(workspaceRoot, label, repoFilter);
 }
@@ -325,7 +343,7 @@ function listIssuesByCampaignStatus(status: 'needs-triage' | 'ready-to-engage') 
   }));
 }
 
-function setIssueWorkflowLabel(issue: string, status: CampaignStatusName, confirm: boolean): IssueLabelUpdateResult {
+export function setIssueWorkflowLabel(issue: string, status: CampaignStatusName, confirm: boolean): IssueLabelUpdateResult {
   const ref = parseIssueRef(issue);
   const current = labelsFromGh(issueContext(ref).labels ?? []);
   const workflowLabels = new Set<string>(CAMPAIGN_LABELS.map((label) => label.name));

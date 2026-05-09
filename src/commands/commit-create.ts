@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
-import { getRepoById, getRepoHealth, loadRepoManifest, type RepoHealth } from '../lib/repos.js';
+import { getRepoById, getRepoHealth, loadRepoManifest, runGit, type RepoHealth } from '../lib/repos.js';
 
 export type CommitCreateOptions = {
   repo?: string;
@@ -126,6 +126,54 @@ function inferRepoFromPath(repos: RepoHealth[], currentPath: string) {
     .sort((left, right) => right.resolvedPath.length - left.resolvedPath.length)[0]?.id;
 }
 
+function gitConfig(repoPath: string, key: string) {
+  const result = runGit(repoPath, ['config', key]);
+  return result.status === 0 && result.stdout ? result.stdout : null;
+}
+
+function branchHasWarRoomMetadata(repo: RepoHealth) {
+  if (!repo.checkedOut || !repo.branch) return false;
+  return Boolean(
+    gitConfig(repo.resolvedPath, `branch.${repo.branch}.warroom-issue`) ||
+      gitConfig(repo.resolvedPath, `branch.${repo.branch}.warroom-implementation-repo`)
+  );
+}
+
+function isWarRoomBranch(repo: RepoHealth) {
+  return Boolean(repo.branch?.match(/^warroom\/\d+-/));
+}
+
+function isNonDefaultBranch(repo: RepoHealth, defaultBranch: string) {
+  return Boolean(repo.branch && repo.branch !== defaultBranch);
+}
+
+function singleRepoId(candidates: RepoHealth[], label: string) {
+  const unique = Array.from(new Map(candidates.map((repo) => [repo.id, repo])).values());
+  if (unique.length === 0) return null;
+  if (unique.length === 1) return unique[0]!.id;
+  throw new Error(
+    `warroom commit create could not infer a unique repo from ${label}: ${unique.map((repo) => repo.id).join(', ')}. Pass --repo <id>.`
+  );
+}
+
+function inferRepoFromMappedBranches(repos: RepoHealth[], defaultBranch: string) {
+  const checkedOut = repos.filter((repo) => repo.checkedOut && repo.branch);
+  const tiers: Array<[string, (repo: RepoHealth) => boolean]> = [
+    ['dirty War Room branch metadata', (repo) => repo.clean === false && branchHasWarRoomMetadata(repo)],
+    ['dirty warroom/* branch', (repo) => repo.clean === false && isWarRoomBranch(repo)],
+    ['dirty non-default branch', (repo) => repo.clean === false && isNonDefaultBranch(repo, defaultBranch)],
+    ['War Room branch metadata', branchHasWarRoomMetadata],
+    ['warroom/* branch', isWarRoomBranch],
+  ];
+
+  for (const [label, predicate] of tiers) {
+    const repoId = singleRepoId(checkedOut.filter(predicate), label);
+    if (repoId) return repoId;
+  }
+
+  return null;
+}
+
 function shellQuote(value: string) {
   return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
 }
@@ -236,8 +284,15 @@ function markdownSummary(result: Omit<CommitCreateResult, 'artifact'>) {
 export function runCommitCreate(workspaceRoot: string, options: CommitCreateOptions = {}): CommitCreateResult {
   const manifest = loadRepoManifest(workspaceRoot);
   const repoHealth = manifest.repos.map((entry) => getRepoHealth(workspaceRoot, entry));
-  const repoId = options.repo ?? inferRepoFromPath(repoHealth, options.currentPath ?? process.cwd());
-  if (!repoId) throw new Error('warroom commit create requires --repo <id> unless run inside a mapped child repo.');
+  const repoId =
+    options.repo ??
+    inferRepoFromPath(repoHealth, options.currentPath ?? process.cwd()) ??
+    inferRepoFromMappedBranches(repoHealth, manifest.defaults.default_branch);
+  if (!repoId) {
+    throw new Error(
+      'warroom commit create requires --repo <id> unless run inside a mapped child repo or on a single active mapped development branch.'
+    );
+  }
   const repoEntry = getRepoById(workspaceRoot, repoId);
   const repo = getRepoHealth(workspaceRoot, repoEntry);
   const dirtyRepos = repoHealth
