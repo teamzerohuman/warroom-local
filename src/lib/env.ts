@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -38,6 +38,8 @@ export type AdapterRunOptions = {
   usage?: LlmUsageContext;
 };
 
+const PROMPT_VISIBLE_ENV_KEYS = ['SENTRY_AUTH_TOKEN', 'SENTRY_ORG'] as const;
+
 function parseEnv(raw: string) {
   const values = new Map<string, string>();
   for (const line of raw.split(/\r?\n/)) {
@@ -69,6 +71,29 @@ function readEnvMap(filePath: string) {
 function localProcessEnv(workspaceRoot: string) {
   const localPath = path.join(workspaceRoot, '.env.local');
   return Object.fromEntries(readEnvMap(localPath));
+}
+
+function adapterRuntimePromptNote(workspaceRoot: string) {
+  const envValues = localProcessEnv(workspaceRoot);
+  const availableKeys = PROMPT_VISIBLE_ENV_KEYS.filter((key) => Boolean(envValues[key]));
+  if (availableKeys.length === 0) return null;
+
+  const envPath = path.relative(workspaceRoot, path.join(workspaceRoot, '.env.local')) || '.env.local';
+  const lines = [
+    'War Room runtime environment:',
+    `- The adapter process has variables from workspace \`${envPath}\` exported into its environment.`,
+    `- Available integration env vars: ${availableKeys.map((key) => `\`${key}\``).join(', ')}.`,
+    '- Use these env vars directly when a matching MCP/plugin/script needs credentials. Do not print, paste, write, or commit their values.',
+  ];
+  if (availableKeys.includes('SENTRY_AUTH_TOKEN')) {
+    lines.push('- If the task references Sentry, use the available Sentry env vars for Sentry MCP/read-only inspection and GitHub-to-Sentry linking.');
+  }
+  return lines.join('\n');
+}
+
+function promptWithAdapterRuntimeNote(workspaceRoot: string, prompt: string) {
+  const note = adapterRuntimePromptNote(workspaceRoot);
+  return note ? `${prompt}\n\n${note}` : prompt;
 }
 
 function codexModelArgs(local: Map<string, string>, example: Map<string, string>, prefix = 'CODEX') {
@@ -160,13 +185,14 @@ export function getInteractiveAdapterInvocation(workspaceRoot: string, cwd = wor
 }
 
 export function runAdapter(workspaceRoot: string, prompt: string, options: AdapterRunOptions = {}): AdapterRunResult {
+  const adapterPrompt = promptWithAdapterRuntimeNote(workspaceRoot, prompt);
   const invocation = withLastMessageOutput(
     getAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot),
     options.outputLastMessagePath
   );
   const captureStdout = options.captureStdout === true;
   process.stderr.write(`Launching adapter: ${invocation.display}\n`);
-  const result = runForegroundAdapterProcess(invocation, prompt, {
+  const result = runForegroundAdapterProcess(invocation, adapterPrompt, {
     captureStdout,
     env: {
       ...process.env,
@@ -180,7 +206,7 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
     options.outputLastMessagePath && existsSync(options.outputLastMessagePath)
       ? readFileSync(options.outputLastMessagePath, 'utf8')
       : null;
-  const usage = recordLlmAdapterUsage(workspaceRoot, options.usage, invocation, prompt, {
+  const usage = recordLlmAdapterUsage(workspaceRoot, options.usage, invocation, adapterPrompt, {
     status: result.status,
     signal: result.signal,
     error,
@@ -269,9 +295,20 @@ function withLastMessageOutput(invocation: AdapterInvocation, outputPath: string
 }
 
 function interactiveCaptureScriptCommand() {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) return null;
   if (process.platform !== 'darwin') return null;
+  if (!hasInteractiveTerminal()) return null;
   return existsSync('/usr/bin/script') ? '/usr/bin/script' : null;
+}
+
+function hasInteractiveTerminal() {
+  if (process.stdin.isTTY && process.stdout.isTTY) return true;
+  try {
+    const fd = openSync('/dev/tty', 'r+');
+    closeSync(fd);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function runInteractiveAdapterProcess(invocation: AdapterInvocation, env: NodeJS.ProcessEnv) {
@@ -312,7 +349,8 @@ function runInteractiveAdapterProcess(invocation: AdapterInvocation, env: NodeJS
 }
 
 export function runInteractiveAdapter(workspaceRoot: string, prompt: string, options: AdapterRunOptions = {}): AdapterRunResult {
-  const invocation = getInteractiveAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot, prompt);
+  const adapterPrompt = promptWithAdapterRuntimeNote(workspaceRoot, prompt);
+  const invocation = getInteractiveAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot, adapterPrompt);
   process.stderr.write(`Launching interactive adapter: ${invocation.display}\n`);
   const result = runInteractiveAdapterProcess(invocation, {
     ...process.env,
@@ -321,7 +359,7 @@ export function runInteractiveAdapter(workspaceRoot: string, prompt: string, opt
   const error =
     result.error?.message ??
     (result.status === 0 ? null : `Adapter exited with status ${result.status ?? 'unknown'}.`);
-  const usage = recordLlmAdapterUsage(workspaceRoot, options.usage, invocation, prompt, {
+  const usage = recordLlmAdapterUsage(workspaceRoot, options.usage, invocation, adapterPrompt, {
     status: result.status,
     signal: result.signal,
     error,

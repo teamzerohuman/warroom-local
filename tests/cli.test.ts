@@ -13,7 +13,7 @@ import { runCampaignStatusCheck } from '../src/commands/campaign.js';
 import { runCommitCreate } from '../src/commands/commit-create.js';
 import { runDoctor } from '../src/commands/doctor.js';
 import { runDevStatus } from '../src/commands/dev-link.js';
-import { getAdapterInvocation, getEnvStatus, getInteractiveAdapterInvocation, runAdapter } from '../src/lib/env.js';
+import { getAdapterInvocation, getEnvStatus, getInteractiveAdapterInvocation, runAdapter, runInteractiveAdapter } from '../src/lib/env.js';
 import { formatLlmUsageSummary, recordLlmAdapterUsage, refreshIssueUsageLedgerCosts, summarizeIssueUsage } from '../src/lib/llm-usage.js';
 import { runMapsAssign } from '../src/commands/maps-assign.js';
 import { runMapsStudy } from '../src/commands/maps-study.js';
@@ -1639,21 +1639,55 @@ describe('phase-1 CLI', () => {
   it('passes .env.local values into local adapter launches', () => {
     const root = makeDevFixture();
     const capturePath = path.join(root, 'adapter-env.txt');
+    const promptCapturePath = path.join(root, 'adapter-prompt.txt');
     const adapterPath = path.join(root, 'fake-codex');
     writeFileSync(
       adapterPath,
-      '#!/bin/sh\nprintf "%s" "$RAILWAY_TOKEN" > "$WARROOM_CAPTURE_PATH"\nexit 0\n'
+      '#!/bin/sh\ncat > "$WARROOM_PROMPT_CAPTURE_PATH"\nprintf "%s" "$RAILWAY_TOKEN" > "$WARROOM_CAPTURE_PATH"\nexit 0\n'
     );
     chmodSync(adapterPath, 0o755);
     writeFileSync(
       path.join(root, '.env.local'),
-      `LLM_ADAPTER=codex\nCODEX_COMMAND=${adapterPath}\nexport RAILWAY_TOKEN="railway_fixture"\nWARROOM_CAPTURE_PATH=${capturePath}\n`
+      `LLM_ADAPTER=codex\nCODEX_COMMAND=${adapterPath}\nexport RAILWAY_TOKEN="railway_fixture"\nSENTRY_ORG=flo-fixture\nSENTRY_AUTH_TOKEN=sentry_fixture\nWARROOM_CAPTURE_PATH=${capturePath}\nWARROOM_PROMPT_CAPTURE_PATH=${promptCapturePath}\n`
     );
 
     const result = runAdapter(root, 'prompt', { cwd: root });
 
     expect(result.launched).toBe(true);
     expect(readFileSync(capturePath, 'utf8')).toBe('railway_fixture');
+    const prompt = readFileSync(promptCapturePath, 'utf8');
+    expect(prompt).toContain('War Room runtime environment:');
+    expect(prompt).toContain('workspace `.env.local`');
+    expect(prompt).toContain('`SENTRY_AUTH_TOKEN`');
+    expect(prompt).toContain('`SENTRY_ORG`');
+    expect(prompt).toContain('Do not print, paste, write, or commit their values.');
+    expect(prompt).not.toContain('sentry_fixture');
+  });
+
+  it('adds available Sentry env names to interactive adapter prompts without values', () => {
+    const root = makeDevFixture();
+    const promptCapturePath = path.join(root, 'interactive-prompt.txt');
+    const adapterPath = path.join(root, 'fake-codex');
+    writeFileSync(
+      adapterPath,
+      '#!/bin/sh\nlast=""\nfor arg in "$@"; do last="$arg"; done\nprintf "%s" "$last" > "$WARROOM_PROMPT_CAPTURE_PATH"\nexit 0\n'
+    );
+    chmodSync(adapterPath, 0o755);
+    writeFileSync(
+      path.join(root, '.env.local'),
+      `LLM_ADAPTER=codex\nCODEX_COMMAND=${adapterPath}\nSENTRY_ORG=flo-fixture\nSENTRY_AUTH_TOKEN=sentry_fixture\nWARROOM_PROMPT_CAPTURE_PATH=${promptCapturePath}\n`
+    );
+
+    const result = runInteractiveAdapter(root, 'interactive prompt', { cwd: root });
+
+    expect(result.launched).toBe(true);
+    const prompt = readFileSync(promptCapturePath, 'utf8');
+    expect(prompt).toContain('interactive prompt');
+    expect(prompt).toContain('War Room runtime environment:');
+    expect(prompt).toContain('workspace `.env.local`');
+    expect(prompt).toContain('`SENTRY_AUTH_TOKEN`');
+    expect(prompt).toContain('Sentry MCP/read-only inspection');
+    expect(prompt).not.toContain('sentry_fixture');
   });
 
   it('reports SDK-to-demo link state from sibling checkouts', () => {

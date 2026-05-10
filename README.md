@@ -167,7 +167,7 @@ War Room records issue-attributed LLM adapter usage automatically. The canonical
 .warroom/runs/issues/TeamFloPay__ally-clicktech__6/usage-summary.md
 ```
 
-The ledger stores metadata, token counts, estimates, and cost fields only; it does not store prompts or model output. `codex exec` output is captured while still being shown in the terminal where possible, so War Room can parse adapter-reported token totals when present. Otherwise it records prompt/output token estimates and marks the entry as estimated. Interactive Codex TUI sessions record prompt estimates and leave output unknown.
+The ledger stores metadata, token counts, estimates, and cost fields only; it does not store prompts or model output. `codex exec` output is captured while still being shown in the terminal where possible, so War Room can parse adapter-reported token totals when present. Interactive Codex TUI sessions use the local terminal capture wrapper when a controlling terminal is available, so the final `Token usage:` footer can be parsed too. Otherwise War Room records prompt/output token estimates and marks the entry as estimated.
 
 Pricing is read from `config/llm-pricing.json`. Missing rates are reported as `Cost: unavailable` rather than treated as zero. Inspect current usage before merge with:
 
