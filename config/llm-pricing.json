@@ -1,0 +1,19 @@
+{
+  "currency": "USD",
+  "effectiveDate": "2026-05-10",
+  "notes": "Manual War Room pricing file. Set rates to numbers per 1,000,000 tokens before relying on cost totals.",
+  "models": {
+    "gpt-5.5": {
+      "inputPerMillion": 5.00,
+      "cachedInputPerMillion": 0.50,
+      "outputPerMillion": 30.00,
+      "notes": ""
+    },
+    "gpt-5.4": {
+      "inputPerMillion": 2.50,
+      "cachedInputPerMillion": 0.25,
+      "outputPerMillion": 15.00,
+      "notes": ""
+    }
+  }
+}

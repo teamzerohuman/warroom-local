@@ -1,6 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { recordLlmAdapterUsage, type LlmUsageContext } from './llm-usage.js';
 
 export type EnvStatus = {
   exampleExists: boolean;
@@ -25,6 +27,7 @@ export type AdapterRunResult = {
   signal: NodeJS.Signals | null;
   error: string | null;
   stdout: string | null;
+  stderr: string | null;
   invocation: AdapterInvocation;
 };
 
@@ -32,6 +35,7 @@ export type AdapterRunOptions = {
   cwd?: string;
   outputLastMessagePath?: string;
   captureStdout?: boolean;
+  usage?: LlmUsageContext;
 };
 
 function parseEnv(raw: string) {
@@ -162,11 +166,8 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
   );
   const captureStdout = options.captureStdout === true;
   process.stderr.write(`Launching adapter: ${invocation.display}\n`);
-  const result = spawnSync(invocation.command, invocation.args, {
-    cwd: invocation.cwd,
-    input: prompt,
-    stdio: ['pipe', captureStdout ? 'pipe' : 'inherit', 'inherit'],
-    encoding: 'utf8',
+  const result = runForegroundAdapterProcess(invocation, prompt, {
+    captureStdout,
     env: {
       ...process.env,
       ...localProcessEnv(workspaceRoot),
@@ -175,6 +176,19 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
   const error =
     result.error?.message ??
     (result.status === 0 ? null : `Adapter exited with status ${result.status ?? 'unknown'}.`);
+  const outputText =
+    options.outputLastMessagePath && existsSync(options.outputLastMessagePath)
+      ? readFileSync(options.outputLastMessagePath, 'utf8')
+      : null;
+  const usage = recordLlmAdapterUsage(workspaceRoot, options.usage, invocation, prompt, {
+    status: result.status,
+    signal: result.signal,
+    error,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    outputText,
+  });
+  if (usage.warning) process.stderr.write(`${usage.warning}\n`);
 
   return {
     launched: result.status === 0,
@@ -182,8 +196,65 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
     signal: result.signal,
     error,
     stdout: captureStdout ? result.stdout ?? '' : null,
+    stderr: result.stderr ?? null,
     invocation,
   };
+}
+
+function shellQuote(value: string) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function runForegroundAdapterProcess(
+  invocation: AdapterInvocation,
+  prompt: string,
+  options: { captureStdout: boolean; env: NodeJS.ProcessEnv }
+) {
+  if (options.captureStdout) {
+    const result = spawnSync(invocation.command, invocation.args, {
+      cwd: invocation.cwd,
+      input: prompt,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      encoding: 'utf8',
+      env: options.env,
+    });
+    if (result.stderr) process.stderr.write(result.stderr);
+    return {
+      status: result.status,
+      signal: result.signal,
+      error: result.error,
+      stdout: result.stdout ?? '',
+      stderr: result.stderr ?? '',
+    };
+  }
+
+  const outputDir = mkdtempSync(path.join(tmpdir(), 'warroom-adapter-output-'));
+  const stdoutPath = path.join(outputDir, 'stdout.log');
+  const stderrPath = path.join(outputDir, 'stderr.log');
+  const command = [shellQuote(invocation.command), ...invocation.args.map(shellQuote)].join(' ');
+  const script = [
+    'set -o pipefail',
+    `${command} 2> >(tee ${shellQuote(stderrPath)} >&2) | tee ${shellQuote(stdoutPath)}`,
+    'exit ${PIPESTATUS[0]}',
+  ].join('\n');
+  try {
+    const result = spawnSync('bash', ['-lc', script], {
+      cwd: invocation.cwd,
+      input: prompt,
+      stdio: ['pipe', 'inherit', 'inherit'],
+      encoding: 'utf8',
+      env: options.env,
+    });
+    return {
+      status: result.status,
+      signal: result.signal,
+      error: result.error,
+      stdout: existsSync(stdoutPath) ? readFileSync(stdoutPath, 'utf8') : '',
+      stderr: existsSync(stderrPath) ? readFileSync(stderrPath, 'utf8') : '',
+    };
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
 }
 
 function withLastMessageOutput(invocation: AdapterInvocation, outputPath: string | undefined): AdapterInvocation {
@@ -212,6 +283,15 @@ export function runInteractiveAdapter(workspaceRoot: string, prompt: string, opt
   const error =
     result.error?.message ??
     (result.status === 0 ? null : `Adapter exited with status ${result.status ?? 'unknown'}.`);
+  const usage = recordLlmAdapterUsage(workspaceRoot, options.usage, invocation, prompt, {
+    status: result.status,
+    signal: result.signal,
+    error,
+    stdout: null,
+    stderr: null,
+    outputText: null,
+  });
+  if (usage.warning) process.stderr.write(`${usage.warning}\n`);
 
   return {
     launched: result.status === 0,
@@ -219,6 +299,7 @@ export function runInteractiveAdapter(workspaceRoot: string, prompt: string, opt
     signal: result.signal,
     error,
     stdout: null,
+    stderr: null,
     invocation,
   };
 }

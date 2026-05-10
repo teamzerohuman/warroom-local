@@ -15,6 +15,12 @@ import {
 } from '../lib/campaign.js';
 import { getAdapterInvocation, runAdapter } from '../lib/env.js';
 import { closingIssueRefFromText, ownerRepoFromText } from '../lib/issue-links.js';
+import {
+  createUsageCommandRunId,
+  summarizeIssueUsage,
+  usageEntriesForCommandRun,
+  type LlmUsageSummary,
+} from '../lib/llm-usage.js';
 import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 import { parseIssueRef, setIssueWorkflowLabel, type IssueLabelUpdateResult, type IssueRef } from './issues.js';
@@ -192,6 +198,7 @@ export type PrPlanResult = {
   mergeE2E?: MergeE2EResult;
   mergeChangelog?: MergeChangelogResult;
   prReviewLoop?: PrReviewLoopResult;
+  usageSummary?: LlmUsageSummary | null;
   contextSummary?: {
     promptCharacters: number;
     changedFiles?: number;
@@ -1813,7 +1820,18 @@ function parseDiffChunkSummary(raw: string) {
   return summary.trim();
 }
 
-function runAdapterForFinalMessage(workspaceRoot: string, repoPath: string, prompt: string) {
+function runAdapterForFinalMessage(
+  workspaceRoot: string,
+  repoPath: string,
+  prompt: string,
+  usage: {
+    issue: string | null;
+    command: string;
+    stage: string;
+    repo: string;
+    commandRunId: string;
+  }
+) {
   const outputDir = mkdtempSync(path.join(tmpdir(), 'warroom-adapter-message-'));
   const outputPath = path.join(outputDir, 'last-message.txt');
   try {
@@ -1821,6 +1839,13 @@ function runAdapterForFinalMessage(workspaceRoot: string, repoPath: string, prom
       cwd: repoPath,
       outputLastMessagePath: outputPath,
       captureStdout: true,
+      usage: {
+        issue: usage.issue,
+        command: usage.command,
+        stage: usage.stage,
+        repo: usage.repo,
+        commandRunId: usage.commandRunId,
+      },
     });
     const message = existsSync(outputPath) ? readFileSync(outputPath, 'utf8') : (launch.stdout?.trim() ?? '');
     return {
@@ -1925,7 +1950,7 @@ function buildDiffChunkSummaryPrompt(options: PrTextPromptOptions, chunk: string
   ].join('\n');
 }
 
-function summarizeDiffForPrText(workspaceRoot: string, repoPath: string, options: PrTextPromptOptions) {
+function summarizeDiffForPrText(workspaceRoot: string, repoPath: string, options: PrTextPromptOptions, commandRunId: string) {
   const diffPatch = options.diffPatch ?? '';
   if (diffPatch.length <= PR_TEXT_DIRECT_DIFF_LIMIT) {
     return { summaries: null as string[] | null, calls: 0, adapterCommand: null as string | null, error: null as string | null };
@@ -1938,7 +1963,14 @@ function summarizeDiffForPrText(workspaceRoot: string, repoPath: string, options
     const result = runAdapterForFinalMessage(
       workspaceRoot,
       repoPath,
-      buildDiffChunkSummaryPrompt(options, chunk, index, chunks.length)
+      buildDiffChunkSummaryPrompt(options, chunk, index, chunks.length),
+      {
+        issue: options.issueRef,
+        command: 'pr-create',
+        stage: `diff-summary-${index + 1}`,
+        repo: options.repo,
+        commandRunId,
+      }
     );
     adapterCommand = result.adapterCommand;
     if (result.error) {
@@ -1976,7 +2008,8 @@ function summarizeDiffForPrText(workspaceRoot: string, repoPath: string, options
 function generatePrText(
   workspaceRoot: string,
   repoPath: string,
-  options: PrTextPromptOptions
+  options: PrTextPromptOptions,
+  commandRunId: string
 ): {
   title: string | null;
   body: string | null;
@@ -1985,7 +2018,7 @@ function generatePrText(
 } {
   let adapterCommand: string | null = null;
   try {
-    const diffSummary = summarizeDiffForPrText(workspaceRoot, repoPath, options);
+    const diffSummary = summarizeDiffForPrText(workspaceRoot, repoPath, options, commandRunId);
     adapterCommand = diffSummary.adapterCommand;
     if (diffSummary.error) {
       return {
@@ -1999,7 +2032,13 @@ function generatePrText(
     const promptOptions = diffSummary.summaries
       ? { ...options, diffPatch: undefined, diffSummaries: diffSummary.summaries }
       : options;
-    const result = runAdapterForFinalMessage(workspaceRoot, repoPath, buildPrTextPrompt(promptOptions));
+    const result = runAdapterForFinalMessage(workspaceRoot, repoPath, buildPrTextPrompt(promptOptions), {
+      issue: options.issueRef,
+      command: 'pr-create',
+      stage: 'pr-text',
+      repo: options.repo,
+      commandRunId,
+    });
     adapterCommand =
       diffSummary.calls > 0
         ? `${result.adapterCommand} (${diffSummary.calls + 1} LLM calls; full diff summarized in ${diffSummary.calls} chunks)`
@@ -2153,6 +2192,7 @@ export function inferPrRefForCurrentBranch(workspaceRoot: string, currentPath: s
 }
 
 export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreateResult {
+  const commandRunId = createUsageCommandRunId('pr-create');
   const repo = repoHealthForCurrentPath(workspaceRoot, options.currentPath ?? process.cwd());
   if (!repo) throw new Error('warroom pr create must be run inside a mapped child repo checkout.');
   if (!repo.checkedOut) throw new Error(`Mapped checkout is missing: ${repo.resolvedPath}`);
@@ -2234,7 +2274,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
       diffStat: diffStat(repo.resolvedPath, base, branch),
       diffNameStatus: diffNameStatus(repo.resolvedPath, base, branch),
       diffPatch: diffPatch(repo.resolvedPath, base, branch),
-    });
+    }, commandRunId);
     prText = {
       source: generated.error ? 'fallback' : 'adapter',
       adapterCommand: generated.adapterCommand,
@@ -2333,6 +2373,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
       'body.md': body,
       ...(issueComment ? { 'issue-comment.json': JSON.stringify(issueComment, null, 2) } : {}),
       ...(issueComment ? { 'issue-comment.md': buildPrCreateIssueCommentBody(baseResult) } : {}),
+      ...(issueRef ? { 'usage.json': JSON.stringify(usageEntriesForCommandRun(workspaceRoot, issueRef, commandRunId), null, 2) } : {}),
     }),
   };
 }
@@ -3128,7 +3169,8 @@ async function runMergeChangelog(
     url?: string;
     body?: string;
     files?: Array<{ path?: string; additions?: number; deletions?: number }>;
-  }
+  },
+  usage: { commandRunId: string }
 ): Promise<MergeChangelogResult> {
   if (!plan.required) return plan;
   if (plan.blocked.length > 0) return { ...plan, status: 'failed', error: plan.blocked.join(' ') };
@@ -3154,7 +3196,16 @@ async function runMergeChangelog(
       changelog: readFileSync(plan.changelogPath, 'utf8'),
     });
     options.mergeStatus?.('Changelog: asking the LLM to update CHANGELOG.md');
-    const adapter = runAdapter(workspaceRoot, prompt, { cwd: plan.path });
+    const adapter = runAdapter(workspaceRoot, prompt, {
+      cwd: plan.path,
+      usage: {
+        issue: options.issue ?? null,
+        command: 'pr-merge',
+        stage: 'changelog',
+        repo: plan.repo,
+        commandRunId: usage.commandRunId,
+      },
+    });
     if (!adapter.launched) throw new Error(adapter.error ?? 'LLM adapter failed to update CHANGELOG.md.');
 
     const changed = gitStatusPaths(plan.path);
@@ -3475,6 +3526,7 @@ function inferImplementationRepo(
 }
 
 export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlanResult {
+  const commandRunId = createUsageCommandRunId('issue-next');
   if (!options.issue) throw new Error('warroom issue next requires --issue owner/repo#number for direct starts.');
   const ref = parseIssueRef(options.issue);
   const issue = ghJson<{
@@ -3605,7 +3657,17 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       launchError: labelUpdate.error,
     };
   }
-  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
+  const launch = runAdapter(workspaceRoot, prompt, {
+    cwd: adapterCwd,
+    usage: {
+      issue: options.issue,
+      command: 'issue-next',
+      stage: 'implementation-handoff',
+      repo: implementationRepo,
+      runDir: artifact?.runDir ?? null,
+      commandRunId,
+    },
+  });
   return {
     prompt,
     artifact,
@@ -3689,7 +3751,8 @@ async function runCodeRabbitPrReviewLoop(
   prUrl: string,
   adapterCwd: string,
   initialSnapshot: PrReviewSnapshot,
-  options: PrOptions
+  options: PrOptions,
+  usage: { runDir: string | null; commandRunId: string }
 ): Promise<{ loop: PrReviewLoopResult; launched: boolean; adapterCommand: string | null; launchError: string | null }> {
   const config = prReviewLoopConfig();
   const iterations: PrReviewLoopResult['iterations'] = [];
@@ -3754,7 +3817,17 @@ async function runCodeRabbitPrReviewLoop(
     const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, threadsForPrompt, options.issue ?? null);
     options.reviewStatus?.(`PR review loop ${index}: launching adapter for ${ref.repo}#${ref.number}.`);
     const localHeadBeforeAdapter = gitHeadShaOrNull(adapterCwd);
-    const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
+    const launch = runAdapter(workspaceRoot, prompt, {
+      cwd: adapterCwd,
+      usage: {
+        issue: options.issue ?? null,
+        command: 'pr-review',
+        stage: `coderabbit-loop-${index}`,
+        repo: ref.repo,
+        runDir: usage.runDir,
+        commandRunId: usage.commandRunId,
+      },
+    });
     adapterCommand = launch.invocation.display;
     const iteration: PrReviewLoopResult['iterations'][number] = {
       iteration: index,
@@ -3879,6 +3952,7 @@ async function runCodeRabbitPrReviewLoop(
 }
 
 export async function runPrReview(workspaceRoot: string, options: PrOptions): Promise<PrPlanResult> {
+  const commandRunId = createUsageCommandRunId('pr-review');
   if (!options.pr) throw new Error('warroom pr review requires --pr owner/repo#number.');
   const ref = parsePrRef(options.pr);
   const pr = prReviewSnapshot(ref);
@@ -3922,7 +3996,10 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
     };
   }
 
-  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prUrl, adapterCwd, pr, resolvedOptions);
+  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prUrl, adapterCwd, pr, resolvedOptions, {
+    runDir: artifact?.runDir ?? null,
+    commandRunId,
+  });
   return {
     prompt,
     artifact,
@@ -3940,6 +4017,7 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
 }
 
 export async function runPrMerge(workspaceRoot: string, options: PrOptions): Promise<PrPlanResult> {
+  const commandRunId = createUsageCommandRunId('pr-merge');
   if (!options.pr) throw new Error('warroom pr merge requires --pr owner/repo#number.');
   const ref = parsePrRef(options.pr);
   const pr = ghJson<{
@@ -4077,7 +4155,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     );
     if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);
     merged = true;
-    mergeChangelog = await runMergeChangelog(workspaceRoot, mergeChangelog, resolvedOptions, pr);
+    mergeChangelog = await runMergeChangelog(workspaceRoot, mergeChangelog, resolvedOptions, pr, { commandRunId });
   }
 
   const completionReadiness =
@@ -4096,12 +4174,14 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     options.issueComment
   );
   const localCleanup = planLocalCleanup(workspaceRoot, ref.repo, pr.headRefName, pr.baseRefName, options);
+  const applyVictoryCloseout = (merged || options.confirmStatus === true) && completionReadiness.blocked.length === 0;
   const campaignStatus = issueRef
-    ? setCampaignStatus(issueRef, 'victory', { confirm: options.confirmStatus && completionReadiness.blocked.length === 0 })
+    ? setCampaignStatus(issueRef, 'victory', { confirm: applyVictoryCloseout })
     : null;
   const labelUpdate = issueRef
-    ? setIssueWorkflowLabel(issueRef, 'victory', options.confirmStatus === true && completionReadiness.blocked.length === 0)
+    ? setIssueWorkflowLabel(issueRef, 'victory', applyVictoryCloseout)
     : null;
+  const usageSummary = merged && issueRef ? summarizeIssueUsage(workspaceRoot, issueRef) : null;
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-merge', {
         'prompt.md': prompt,
@@ -4116,6 +4196,8 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
         ...(finalIssueComment
           ? { 'final-issue-comment.md': buildFinalVictoryComment(options.pr, pr, mergeE2E, mergeChangelog) }
           : {}),
+        ...(usageSummary ? { 'final-usage-summary.json': JSON.stringify(usageSummary, null, 2) } : {}),
+        ...(issueRef ? { 'usage.json': JSON.stringify(usageEntriesForCommandRun(workspaceRoot, issueRef, commandRunId), null, 2) } : {}),
         'local-cleanup.json': JSON.stringify(localCleanup, null, 2),
       })
     : null;
@@ -4132,6 +4214,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     mergeReadiness: readiness,
     mergeE2E,
     mergeChangelog,
+    usageSummary,
     summary,
     summaryPosts,
     finalIssueComment,

@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { getAdapterInvocation, runAdapter } from '../lib/env.js';
+import { createUsageCommandRunId, usageEntriesForCommandRun } from '../lib/llm-usage.js';
 import { getRepoById, getRepoHealth, loadRepoManifest, runGit, type RepoHealth } from '../lib/repos.js';
 
 export type CommitCreateOptions = {
@@ -380,7 +381,16 @@ function parseCommitSummary(raw: string) {
   return summary.trim();
 }
 
-function runAdapterForFinalMessage(workspaceRoot: string, repoPath: string, prompt: string) {
+function runAdapterForFinalMessage(
+  workspaceRoot: string,
+  repoPath: string,
+  prompt: string,
+  usage: {
+    issue: string | null;
+    repo: string;
+    commandRunId: string;
+  }
+) {
   const outputDir = mkdtempSync(path.join(tmpdir(), 'warroom-commit-summary-'));
   const outputPath = path.join(outputDir, 'last-message.txt');
   try {
@@ -388,6 +398,13 @@ function runAdapterForFinalMessage(workspaceRoot: string, repoPath: string, prom
       cwd: repoPath,
       outputLastMessagePath: outputPath,
       captureStdout: true,
+      usage: {
+        issue: usage.issue,
+        command: 'commit-create',
+        stage: 'commit-summary',
+        repo: usage.repo,
+        commandRunId: usage.commandRunId,
+      },
     });
     const message = existsSync(outputPath) ? readFileSync(outputPath, 'utf8') : (launch.stdout?.trim() ?? '');
     return {
@@ -452,7 +469,11 @@ function fallbackCommitSummary(result: Omit<CommitCreateResult, 'artifact' | 'is
   return `Committed \`${result.suggestedMessage}\` with ${changed} changed file${changed === 1 ? '' : 's'}.${validation}`.trim();
 }
 
-function generateCommitSummary(workspaceRoot: string, result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>) {
+function generateCommitSummary(
+  workspaceRoot: string,
+  result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>,
+  commandRunId: string
+) {
   if (!result.committed || !result.committedSha) {
     return { summary: fallbackCommitSummary(result), adapterCommand: null as string | null, error: null as string | null };
   }
@@ -460,7 +481,11 @@ function generateCommitSummary(workspaceRoot: string, result: Omit<CommitCreateR
   let adapterCommand: string | null = null;
   try {
     const diff = gitShow(result.path, result.committedSha);
-    const adapter = runAdapterForFinalMessage(workspaceRoot, result.path, buildCommitSummaryPrompt(result, diff));
+    const adapter = runAdapterForFinalMessage(workspaceRoot, result.path, buildCommitSummaryPrompt(result, diff), {
+      issue: result.issue,
+      repo: result.githubRepo,
+      commandRunId,
+    });
     adapterCommand = adapter.adapterCommand;
     if (adapter.error) {
       return { summary: fallbackCommitSummary(result), adapterCommand, error: adapter.error };
@@ -481,7 +506,8 @@ function generateCommitSummary(workspaceRoot: string, result: Omit<CommitCreateR
 function commitIssueCommentBody(
   workspaceRoot: string,
   result: Omit<CommitCreateResult, 'artifact' | 'issueComment'>,
-  summaryResult = generateCommitSummary(workspaceRoot, result)
+  commandRunId: string,
+  summaryResult = generateCommitSummary(workspaceRoot, result, commandRunId)
 ) {
   const lines = [
     '## War Room commit update',
@@ -526,6 +552,7 @@ function buildIssueCommentResult(
 }
 
 export function runCommitCreate(workspaceRoot: string, options: CommitCreateOptions = {}): CommitCreateResult {
+  const commandRunId = createUsageCommandRunId('commit-create');
   const manifest = loadRepoManifest(workspaceRoot);
   const repoHealth = manifest.repos.map((entry) => getRepoHealth(workspaceRoot, entry));
   const repoId =
@@ -617,7 +644,7 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
     blocked,
   };
   const issueCommentBody =
-    issueRef && options.issueComment !== false ? commitIssueCommentBody(workspaceRoot, baseResult) : null;
+    issueRef && options.issueComment !== false ? commitIssueCommentBody(workspaceRoot, baseResult, commandRunId) : null;
   const issueComment = buildIssueCommentResult(
     issueRef,
     options.confirm,
@@ -654,6 +681,7 @@ export function runCommitCreate(workspaceRoot: string, options: CommitCreateOpti
       'summary.md': markdownSummary(result),
       ...(issueComment ? { 'issue-comment.json': JSON.stringify(issueComment, null, 2) } : {}),
       ...(issueCommentBody ? { 'issue-comment.md': issueCommentBody } : {}),
+      ...(issueRef ? { 'usage.json': JSON.stringify(usageEntriesForCommandRun(workspaceRoot, issueRef, commandRunId), null, 2) } : {}),
       'status.txt': repo.statusLines.join('\n'),
       'validation.json': JSON.stringify(validation, null, 2),
     }),

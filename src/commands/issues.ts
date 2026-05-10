@@ -6,6 +6,7 @@ import { loadAlliesManifest, resolveAllyIssueRepo, type AllyEntry } from '../lib
 import { CAMPAIGN_LABELS, listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusName, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getInteractiveAdapterInvocation, runInteractiveAdapter } from '../lib/env.js';
 import { ownerRepoFromText } from '../lib/issue-links.js';
+import { attachRunUsageToIssue, createUsageCommandRunId } from '../lib/llm-usage.js';
 import { getRepoHealth, loadRepoManifest } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 
@@ -545,6 +546,12 @@ function buildIssueCreatePrompt(workspaceRoot: string, draftPath: string, option
     '- Do not edit code, create branches, commit changes, open pull requests, or mutate GitHub directly.',
     '- Do not include raw client PII, secrets, private endpoints, tokens, payment details, or sensitive exports in the issue.',
     '',
+    'Sentry linkage:',
+    '- If the user references a Sentry issue, Sentry event, Sentry short ID, or Sentry URL, preserve that reference in the draft issue body.',
+    '- Add enough non-sensitive Sentry context for triage to find the same issue again, but do not copy raw stack traces, request payloads, user PII, or secrets.',
+    '- Note in the draft body that technical triage must link the created GitHub issue to the referenced Sentry issue using [@sentry](plugin://sentry@openai-curated) / Sentry MCP when available.',
+    '- Do not claim the Sentry link already exists during issue creation; the GitHub issue does not exist until the CLI creates it after this session.',
+    '',
     'Choose the target repo:',
     '- Use an ally issue repo when the issue is client-facing or the client must keep access to the details.',
     '- Use a mapped product repo for internal/product-only work that does not need to live in an ally repo.',
@@ -745,6 +752,9 @@ function createIssueFromDraft(workspaceRoot: string, result: IssueCreateResult):
   const closeoutErrors: string[] = [];
 
   if (issue) {
+    const usageMigration = attachRunUsageToIssue(workspaceRoot, result.artifact?.runDir, issue);
+    if (usageMigration.warning) closeoutErrors.push(usageMigration.warning);
+
     try {
       campaignStatus = setCampaignStatus(issue, 'needs-triage', { confirm: true });
     } catch (error) {
@@ -850,17 +860,25 @@ function buildTriagePrompt(workspaceRoot: string, ref: IssueRef) {
     '- This is planning and issue triage only. Do not implement code.',
     '- Do not edit repository files, create branches, commit changes, open pull requests, run formatters, or create implementation artifacts.',
     '- Use read-only inspection only: GitHub issue/PR context, docs, safe logs, and read-only provider/API checks when credentials are available.',
+    '- Exception: if the issue references a Sentry issue, Sentry event, Sentry short ID, or Sentry URL, use [@sentry](plugin://sentry@openai-curated) / Sentry MCP to link this GitHub issue to the referenced Sentry issue when linking is supported.',
+    '- Do not mutate Sentry status, assignees, resolution, or event data during triage; only create/verify the GitHub-to-Sentry issue link and inspect safely.',
     '- Treat client data, secrets, payment details, private URLs, and raw PII as confidential. Do not copy them into GitHub comments or local files.',
     '- If Codex offers a Plan mode, stay in Plan mode for this session. Do not switch into implementation mode.',
     '',
     'Interactive triage workflow:',
-    '- Use @grill-me: ask blocking clarification questions one at a time and wait for the user answer before finalizing the plan.',
-    '- If a question can be answered safely by read-only investigation, do that investigation and summarize only non-sensitive facts.',
+    '- Use the grill-me interview behavior literally, not just as a label.',
+    '- Interview the user relentlessly about every aspect of the issue until there is shared understanding.',
+    '- Walk down each branch of the decision tree, resolving dependencies between decisions one-by-one.',
+    '- Ask exactly one blocking clarification question at a time, and include your recommended answer with that question.',
+    '- After asking a blocking question, stop and wait for the user answer. Do not include the final battle plan in the same response as a blocking question.',
+    '- If a question can be answered safely by read-only investigation, do that investigation instead of asking, then summarize only non-sensitive facts.',
+    '- Only produce and post final triage notes after all blocking branches are resolved or after read-only investigation proves no user answer is needed.',
     '- Stop when the issue has a clear owner repo, problem statement, acceptance criteria, risks, dependencies, and validation commands.',
     '',
     'Goal:',
     '- Produce a compact implementation-ready battle plan, but do not implement it.',
     '- Post the final triage notes back to this GitHub issue using [@github](plugin://github@openai-curated) or `gh issue comment`.',
+    '- If a Sentry issue was referenced, include the Sentry issue URL or short ID and a `Sentry link:` line stating linked, already linked, or blocked with the specific blocker.',
     `- Start the GitHub issue comment with exactly: ${TRIAGE_NOTES_MARKER}`,
     `- Include a standalone readiness line: \`${TRIAGE_READY_LINE}\` only when the issue has enough information to move forward, or \`Ready for ready-to-engage: no\` when a blocker remains.`,
     '- The GitHub issue comment must include: owner repo, diagnosis or remaining unknowns, acceptance criteria, implementation plan, validation commands, dependencies/blockers, and a concise safe client-facing summary when relevant.',
@@ -1013,6 +1031,7 @@ export function runIssueCreate(workspaceRoot: string, options: IssueCreateOption
   const needsAdapter = !directDraft?.draft;
   const shouldLaunch = needsAdapter && options.dryRun === false;
   const artifactContext = shouldLaunch || options.writeArtifact ? createIssueCreateArtifact(workspaceRoot, options) : null;
+  const commandRunId = createUsageCommandRunId('issue-create');
   const draftPath = artifactContext?.draftPath ?? path.join('<warroom-run>', 'issue-draft.json');
   const prompt = buildIssueCreatePrompt(workspaceRoot, draftPath, options);
   if (artifactContext) writeFileSync(artifactContext.promptPath, `${prompt}\n`);
@@ -1037,7 +1056,17 @@ export function runIssueCreate(workspaceRoot: string, options: IssueCreateOption
     return emptyIssueCreateResult(prompt, artifactContext?.artifact ?? null, artifactContext?.draftPath ?? null, adapterCommand, false, null, null, null);
   }
 
-  const launch = runInteractiveAdapter(workspaceRoot, prompt, { cwd: workspaceRoot });
+  const launch = runInteractiveAdapter(workspaceRoot, prompt, {
+    cwd: workspaceRoot,
+    usage: {
+      issue: null,
+      command: 'issue-create',
+      stage: 'pm-session',
+      repo: null,
+      runDir: artifactContext?.artifact.runDir ?? null,
+      commandRunId,
+    },
+  });
   const parsed = launch.launched && artifactContext ? parseIssueCreateDraft(workspaceRoot, artifactContext.draftPath) : { draft: null, error: null, warnings: [] };
   const result = emptyIssueCreateResult(
     prompt,
@@ -1074,6 +1103,7 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
   const adapterCommand = getInteractiveAdapterInvocation(workspaceRoot, adapterCwd).display;
   const contextSummary = { promptCharacters: prompt.length };
   const shouldMarkReady = options.markReady === true;
+  const commandRunId = createUsageCommandRunId('issue-triage');
 
   if (options.dryRun !== false) {
     const campaignStatus = shouldMarkReady
@@ -1084,7 +1114,17 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
   }
 
   const beforeComments = shouldMarkReady ? issueComments(ref) : { comments: [], error: null };
-  const launch = runInteractiveAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
+  const launch = runInteractiveAdapter(workspaceRoot, prompt, {
+    cwd: adapterCwd,
+    usage: {
+      issue: options.issue,
+      command: 'issue-triage',
+      stage: 'interactive-triage',
+      repo: ref.repo,
+      runDir: artifact?.runDir ?? null,
+      commandRunId,
+    },
+  });
   let campaignStatus: CampaignStatusSetResult | null = null;
   let labelUpdate: IssueLabelUpdateResult | null = null;
   let triageNotes: TriageNotesResult | null = null;

@@ -20,6 +20,7 @@ import { runSync } from '../src/commands/sync.js';
 
 const workspaceRoot = new URL('..', import.meta.url).pathname;
 const FAST_PR_REVIEW_ENV = ['WARROOM_PR_REVIEW_POLL_MS', 'WARROOM_PR_REVIEW_CODERABBIT_SETTLE_MS'] as const;
+const OUTCOME_SEPARATOR = '-----------------------------------------';
 
 function setFastPrReviewPolling() {
   const original = Object.fromEntries(FAST_PR_REVIEW_ENV.map((key) => [key, process.env[key]]));
@@ -31,6 +32,19 @@ function setFastPrReviewPolling() {
       else process.env[key] = value;
     }
   };
+}
+
+function expectBoxedOutcome(lines: string[], outcome: string) {
+  const index = lines.indexOf(outcome);
+  expect(index).toBeGreaterThan(0);
+  expect(lines[index - 1]).toBe(OUTCOME_SEPARATOR);
+  expect(lines[index + 1]).toBe(OUTCOME_SEPARATOR);
+  return index;
+}
+
+function expectFinalOutcome(lines: string[], outcome: string) {
+  const index = expectBoxedOutcome(lines, outcome);
+  expect(index).toBe(lines.length - 2);
 }
 
 describe('phase-1 CLI', () => {
@@ -158,6 +172,20 @@ describe('phase-1 CLI', () => {
         encoding: 'utf8',
       });
       expect(branch.stdout.trim()).toBe('warroom/7-build-the-selector');
+
+      const usageLedger = path.join(root, '.warroom', 'runs', 'issues', 'TeamFloPay__sdk__7', 'usage-ledger.json');
+      expect(existsSync(usageLedger)).toBe(true);
+      const usage = JSON.parse(readFileSync(usageLedger, 'utf8')) as { entries: Array<{ command: string; stage: string; inputTokens: number | null }> };
+      expect(usage.entries.some((entry) => entry.command === 'issue-next' && entry.stage === 'implementation-handoff')).toBe(true);
+
+      const usageLines: string[] = [];
+      const usageProgram = buildProgram({ cwd: root, output: (line) => usageLines.push(line) });
+      await usageProgram.parseAsync(['node', 'warroom', 'issue', 'usage', '--issue', 'TeamFloPay/sdk#7']);
+      expect(usageLines).toContain('War Room LLM usage for TeamFloPay/sdk#7:');
+      expect(usageLines).toContain('- Entries: 1');
+      expect(usageLines.some((line) => line.startsWith('- Input tokens: '))).toBe(true);
+      expect(usageLines.some((line) => line.includes('unknown output'))).toBe(true);
+      expect(usageLines).toContain('- Cost: unavailable; pricing missing for gpt-5.5');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -441,6 +469,20 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('includes Sentry linkage instructions in issue creation prompts', async () => {
+    const root = makeDevFixture();
+    const lines: string[] = [];
+    const program = buildProgram({ cwd: root, output: (line) => lines.push(line), interactive: true });
+
+    await program.parseAsync(['node', 'warroom', 'issue', 'create', '--dry-run']);
+
+    expect(lines).toContain('Issue create: dry run');
+    expect(lines.some((line) => line.includes('Sentry linkage:'))).toBe(true);
+    expect(lines.some((line) => line.includes('preserve that reference in the draft issue body'))).toBe(true);
+    expect(lines.some((line) => line.includes('link the created GitHub issue to the referenced Sentry issue'))).toBe(true);
+    expect(lines.some((line) => line.includes('Do not claim the Sentry link already exists during issue creation'))).toBe(true);
+  });
+
   it('selects a triage issue and launches a scoped triage handoff', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
@@ -485,8 +527,14 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('Title: Shape the triage workflow'))).toBe(true);
       expect(lines.some((line) => line.includes('This is planning and issue triage only. Do not implement code.'))).toBe(true);
       expect(lines.some((line) => line.includes('Do not edit repository files, create branches, commit changes, open pull requests'))).toBe(true);
-      expect(lines.some((line) => line.includes('Use @grill-me: ask blocking clarification questions one at a time'))).toBe(true);
+      expect(lines.some((line) => line.includes('use [@sentry](plugin://sentry@openai-curated) / Sentry MCP to link this GitHub issue'))).toBe(true);
+      expect(lines.some((line) => line.includes('Do not mutate Sentry status, assignees, resolution, or event data during triage'))).toBe(true);
+      expect(lines.some((line) => line.includes('Use the grill-me interview behavior literally, not just as a label.'))).toBe(true);
+      expect(lines.some((line) => line.includes('Ask exactly one blocking clarification question at a time'))).toBe(true);
+      expect(lines.some((line) => line.includes('Do not include the final battle plan in the same response as a blocking question.'))).toBe(true);
+      expect(lines.some((line) => line.includes('If a question can be answered safely by read-only investigation, do that investigation instead of asking'))).toBe(true);
       expect(lines.some((line) => line.includes('Post the final triage notes back to this GitHub issue'))).toBe(true);
+      expect(lines.some((line) => line.includes('Sentry link:'))).toBe(true);
       expect(lines.some((line) => line.includes('## War Room triage notes'))).toBe(true);
       expect(lines.some((line) => line.includes('Ready for ready-to-engage: yes'))).toBe(true);
       expect(lines.some((line) => line.includes('Issue body:'))).toBe(true);
@@ -500,7 +548,7 @@ describe('phase-1 CLI', () => {
     }
   });
 
-  it('prompts from a direct issue triage dry run into a launched handoff', async () => {
+  it('launches a direct issue triage handoff by default', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
@@ -515,7 +563,7 @@ describe('phase-1 CLI', () => {
       const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      const answers = ['yes\n', 'yes\n', 'no\n'];
+      const answers = ['yes\n', 'no\n'];
       const promptAnswers = setInterval(() => {
         const answer = answers.shift();
         if (answer) input.write(answer);
@@ -528,7 +576,7 @@ describe('phase-1 CLI', () => {
         input.end();
       }
 
-      expect(lines).toContain(
+      expect(lines).not.toContain(
         'Start issue triage handoff for TeamFloPay/sdk#4 now? This will run `warroom issue triage --issue TeamFloPay/sdk#4 --launch --mark-ready --confirm-status`. [y/N]'
       );
       expect(lines).not.toContain('Outcome: dry run only; no LLM handoff was launched.');
@@ -541,6 +589,31 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Issue start: launched');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> battlefield-active');
       expect(lines.at(-1)).toBe('Run `warroom pr create` next? [y/N]');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('prints a direct issue triage handoff with --dry-run', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'triage', '--issue', 'TeamFloPay/sdk#4', '--dry-run']);
+
+      expect(lines).not.toContain('Triaging TeamFloPay/sdk#4');
+      expect(lines.some((line) => line.includes('Adapter: codex --model gpt-5.5 ') && line.endsWith(' <prompt> (not launched)'))).toBe(true);
+      expect(lines).toContain('Outcome: dry run only; no LLM handoff was launched.');
+      expect(lines.some((line) => line.includes('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage'))).toBe(false);
     } finally {
       process.env.PATH = originalPath;
     }
@@ -577,7 +650,8 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Triage notes: missing');
       expect(lines.some((line) => line.includes('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage'))).toBe(false);
       expect(lines.some((line) => line.includes('Issue labels: updated TeamFloPay/sdk#4 +ready-to-engage'))).toBe(false);
-      expect(lines.at(-1)).toBe(
+      expectFinalOutcome(
+        lines,
         'Outcome: interactive issue triage session completed, but Campaign status was not updated. No new issue comment containing "## War Room triage notes" was found.'
       );
     } finally {
@@ -625,6 +699,10 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/ally-clicktech/issues/5#issuecomment-triage');
       expect(lines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#5 -> ready-to-engage');
       expect(lines).toContain('Issue labels: updated TeamFloPay/ally-clicktech#5 +ready-to-engage; removed needs-triage');
+      expectBoxedOutcome(
+        lines,
+        'Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.'
+      );
       expect(lines.at(-1)).toBe('Run `warroom issue next --issue TeamFloPay/ally-clicktech#5` now? [y/N]');
     } finally {
       process.env.PATH = originalPath;
@@ -657,7 +735,10 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('git switch -c warroom/7-build-the-selector --track origin/warroom/7-build-the-selector'))).toBe(true);
       expect(lines.some((line) => line.includes('not a blocker unless the fetch/switch fails'))).toBe(false);
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
-      expect(lines.at(-1)).toBe('Outcome: LLM adapter completed on warroom/7-build-the-selector; no background session remains. Campaign status updated to battlefield-active.');
+      expectFinalOutcome(
+        lines,
+        'Outcome: LLM adapter completed on warroom/7-build-the-selector; no background session remains. Campaign status updated to battlefield-active.'
+      );
     } finally {
       process.env.PATH = originalPath;
     }
@@ -689,7 +770,10 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.startsWith('Development checkout: not checked out'))).toBe(true);
       expect(lines.some((line) => line.includes('branch blocked: Mapped checkout has local changes.'))).toBe(true);
       expect(lines.some((line) => line.includes('Campaign status: updated'))).toBe(false);
-      expect(lines.at(-1)).toBe('Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.');
+      expectFinalOutcome(
+        lines,
+        'Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.'
+      );
 
       const branch = spawnSync('git', ['branch', '--show-current'], { cwd: sdk, encoding: 'utf8' });
       expect(branch.stdout.trim()).toBe('main');
@@ -718,7 +802,10 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('Issue start: blocked');
       expect(lines.some((line) => line.includes('branch blocked: Mapped checkout has local changes.'))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.');
+      expectFinalOutcome(
+        lines,
+        'Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.'
+      );
     } finally {
       process.env.PATH = originalPath;
       process.exitCode = undefined;
@@ -795,7 +882,10 @@ describe('phase-1 CLI', () => {
       const runDir = artifactLine!.replace('Artifact: ', '');
       expect(readFileSync(path.join(runDir, 'issue.json'), 'utf8')).toContain('FULL_BODY_SENTINEL');
       expect(readFileSync(path.join(runDir, 'issue.json'), 'utf8')).toContain('FULL_COMMENT_SENTINEL');
-      expect(lines.at(-1)).toBe('Outcome: dry run only; no LLM handoff was launched, no development branch was created, and no Campaign status was updated.');
+      expectFinalOutcome(
+        lines,
+        'Outcome: dry run only; no LLM handoff was launched, no development branch was created, and no Campaign status was updated.'
+      );
     } finally {
       process.env.PATH = originalPath;
     }
@@ -1021,7 +1111,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review: complete');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> skirmish');
       expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#7 +skirmish; removed battlefield-active');
-      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
       expect(Number(readFileSync(`${stateFile}.polls`, 'utf8'))).toBeGreaterThanOrEqual(4);
     } finally {
       restorePrReviewEnv();
@@ -1049,7 +1139,8 @@ describe('phase-1 CLI', () => {
       expect(lines[1]).toContain('updated 2026-05-06T12:00:00Z; issue TeamFloPay/sdk#8 battlefield-active');
       expect(lines[2]).toContain('TeamFloPay/demo#3 Review demo follow-up');
       expect(lines[2]).toContain('updated 2026-05-05T12:00:00Z; issue TeamFloPay/demo#9 skirmish');
-      expect(lines[3]).toBe(
+      expectBoxedOutcome(
+        lines,
         'Outcome: listed 2 PRs ready for review; no LLM handoff was launched. Run `warroom pr review --pr <owner/repo#number> --launch` to start one.'
       );
     } finally {
@@ -1080,7 +1171,10 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Resolved current branch PR: TeamFloPay/sdk#659');
       expect(lines).toContain('PR review: preflight only');
       expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/sdk/pull/659'))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.');
+      expectFinalOutcome(
+        lines,
+        'Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.'
+      );
     } finally {
       process.env.PATH = originalPath;
     }
@@ -1121,7 +1215,7 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('must post one final reply on every listed thread'))).toBe(true);
       expect(lines.some((line) => line.includes('Do not stop before code changes only because the reaction could not be added.'))).toBe(true);
       expect(lines).toContain('PR review loop iterations: 2');
-      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;
@@ -1160,7 +1254,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review loop: adapter left 1 changed file; committing them before waiting for CodeRabbit.');
       expect(lines.some((line) => line.startsWith('PR review loop: pushing review commit '))).toBe(true);
       expect(lines).toContain('PR review loop 1: no outstanding CodeRabbit feedback remains.');
-      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
 
       const status = spawnSync('git', ['status', '--short'], { cwd: sdk, encoding: 'utf8' });
       expect(status.stdout.trim()).toBe('');
@@ -1202,7 +1296,10 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('Thread ID: PRRT_fixture_1'))).toBe(true);
       expect(lines.some((line) => line.includes('Review comment ID: PRRC_fixture_1'))).toBe(true);
       expect(lines.some((line) => line.includes('gh api graphql -f threadId=<THREAD_ID>'))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.');
+      expectFinalOutcome(
+        lines,
+        'Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.'
+      );
     } finally {
       process.env.PATH = originalPath;
     }
@@ -1228,7 +1325,7 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('PR review loop: failed');
       expect(lines.some((line) => line.includes('review loop blocked: LLM adapter did not post final replies to 1 CodeRabbit review thread'))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: PR review loop blocked. Resolve the blocker above, then rerun the PR review command.');
+      expectFinalOutcome(lines, 'Outcome: PR review loop blocked. Resolve the blocker above, then rerun the PR review command.');
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;
@@ -1255,7 +1352,7 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('PR review loop 1: 1 outstanding CodeRabbit comment remains; starting another adapter loop.');
       expect(lines).toContain('PR review loop 2: no outstanding CodeRabbit feedback remains.');
-      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
       expect(Number(readFileSync(`${stateFile}.polls`, 'utf8'))).toBeGreaterThanOrEqual(4);
     } finally {
       restorePrReviewEnv();
@@ -1293,7 +1390,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Issue labels: updated TeamFloPay/backend#632 +skirmish; removed battlefield-active');
       expect(lines).toContain('PR review loop 1: no outstanding CodeRabbit feedback remains.');
       expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/backend/pull/657'))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;
@@ -1322,7 +1419,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review: launched');
       expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines.some((line) => line.includes('codex cloud exec'))).toBe(false);
-      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;
@@ -1347,7 +1444,10 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review: preflight only');
       expect(lines.some((line) => line.includes('Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)'))).toBe(true);
       expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/backend/pull/655'))).toBe(true);
-      expect(lines.at(-1)).toBe('Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.');
+      expectFinalOutcome(
+        lines,
+        'Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.'
+      );
     } finally {
       process.env.PATH = originalPath;
     }
@@ -1842,6 +1942,52 @@ describe('phase-1 CLI', () => {
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
+    const usageDir = path.join(root, '.warroom', 'runs', 'issues', 'TeamFloPay__backend__562');
+    mkdirSync(usageDir, { recursive: true });
+    writeFileSync(
+      path.join(usageDir, 'usage-ledger.json'),
+      JSON.stringify(
+        {
+          schemaVersion: 1,
+          issue: 'TeamFloPay/backend#562',
+          updatedAt: '2026-05-10T00:00:00.000Z',
+          entries: [
+            {
+              id: 'fixture-usage-entry',
+              timestamp: '2026-05-10T00:00:00.000Z',
+              issue: 'TeamFloPay/backend#562',
+              command: 'issue-next',
+              stage: 'implementation-handoff',
+              repo: 'TeamFloPay/backend',
+              cwd: null,
+              adapter: 'codex',
+              model: 'gpt-5.5',
+              reasoningEffort: 'xhigh',
+              mode: 'foreground',
+              commandDisplay: 'codex exec --model gpt-5.5',
+              commandRunId: 'fixture-run',
+              runDir: null,
+              status: 'succeeded',
+              exitStatus: 0,
+              signal: null,
+              error: null,
+              promptCharacters: 400,
+              outputCharacters: 80,
+              inputTokens: 100,
+              cachedInputTokens: null,
+              outputTokens: 20,
+              totalTokens: 120,
+              estimated: true,
+              usageSource: 'estimated',
+              costUsd: null,
+              costUnavailableReason: 'pricing missing for gpt-5.5',
+            },
+          ],
+        },
+        null,
+        2
+      )
+    );
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
@@ -1850,10 +1996,28 @@ describe('phase-1 CLI', () => {
       const lines: string[] = [];
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
 
-      await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/infra#655', '--confirm']);
+      await program.parseAsync([
+        'node',
+        'warroom',
+        'pr',
+        'merge',
+        '--pr',
+        'TeamFloPay/infra#655',
+        '--issue',
+        'TeamFloPay/backend#562',
+        '--confirm',
+      ]);
 
       expect(lines).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/infra.)');
       expect(lines).toContain('Merged: yes');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/backend#562 -> victory');
+      expect(lines).toContain(
+        'Issue labels: updated TeamFloPay/backend#562 +victory; removed battlefield-active, ready-to-engage, skirmish'
+      );
+      expect(lines).toContain('War Room LLM usage for TeamFloPay/backend#562:');
+      expect(lines).toContain('- Entries: 1');
+      expect(lines).toContain('- Total tokens: 120 estimated');
+      expect(lines).toContain('- Cost: unavailable; pricing missing for gpt-5.5');
       expect(lines.some((line) => line.startsWith('Backend:'))).toBe(false);
       expect(existsSync(path.join(root, 'backend-started.txt'))).toBe(false);
     } finally {
@@ -3248,6 +3412,17 @@ if (args[0] === 'issue' && args[1] === 'develop') {
 
 if (args[0] === 'issue' && args[1] === 'view') {
   const issueNumber = args[2];
+  const issueRepo = optionValue('--repo') || 'TeamFloPay/sdk';
+  if (issueRepo === 'TeamFloPay/backend' && issueNumber === '562') {
+    json({
+      title: 'Backend merge closeout',
+      body: 'Close out the backend merge workflow.',
+      url: 'https://github.com/TeamFloPay/backend/issues/562',
+      labels: [{ name: 'battlefield-active' }, { name: 'ready-to-engage' }, { name: 'skirmish' }],
+      comments: []
+    });
+    process.exit(0);
+  }
   if (issueNumber === '4') {
     const comments = existsSync(triageNotesPath)
       ? [
@@ -3335,6 +3510,11 @@ if (args[0] === 'project' && args[1] === 'field-list') {
 }
 
 if (args[0] === 'project' && args[1] === 'item-edit') {
+  process.exit(0);
+}
+
+if (args[0] === 'project' && args[1] === 'item-add') {
+  json({ id: 'PVTI_added' });
   process.exit(0);
 }
 

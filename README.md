@@ -85,7 +85,7 @@ warroom campaign labels
 warroom issue create
 ```
 
-In an interactive terminal, `issue create` launches a PM-style Codex session that uses light `@grill-me` questioning to capture business scope, not technical implementation detail. The adapter writes a structured issue draft under `.warroom/runs/*`; War Room previews the repo, title, body, labels, and issue type, then asks before creating the GitHub issue. Confirmed creates add the issue to the Campaign Map as `needs-triage`, apply the `needs-triage` workflow label plus ally labels when the target is an ally issue repo, and best-effort set the GitHub issue type through GraphQL. After printing the issue URL and `Outcome:` line, War Room asks whether to start `warroom issue triage` for the new issue.
+In an interactive terminal, `issue create` launches a PM-style Codex session that uses light `@grill-me` questioning to capture business scope, not technical implementation detail. The adapter writes a structured issue draft under `.warroom/runs/*`; War Room previews the repo, title, body, labels, and issue type, then asks before creating the GitHub issue. If the business context references a Sentry issue, event, short ID, or URL, the draft must preserve that reference and note that triage should link the created GitHub issue back to Sentry using the Sentry MCP. Confirmed creates add the issue to the Campaign Map as `needs-triage`, apply the `needs-triage` workflow label plus ally labels when the target is an ally issue repo, and best-effort set the GitHub issue type through GraphQL. After printing the issue URL and `Outcome:` line, War Room asks whether to start `warroom issue triage` for the new issue.
 
 3. Triage the existing issue.
 
@@ -94,7 +94,7 @@ warroom issue triage
 warroom issue triage --issue "$ISSUE" --launch --mark-ready --confirm-status --write-artifact
 ```
 
-In an interactive terminal, `issue triage` prints numbered `needs-triage` Campaign Map items and lets you choose one to launch the scoped triage handoff in the Codex TUI, so `@grill-me` questions can be answered directly. Triage handoffs are planning-only: they may do read-only investigation, ask questions, and post final triage notes back to the GitHub issue, but must not edit code, create branches, commit, or open PRs. War Room starts Codex with workspace-write sandboxing plus outbound network access for read-only API checks. Add `--dry-run` to preview the selected handoff without launching. With `--issue`, it builds that handoff directly with repo specialist context and previews by default unless `--launch` is passed. Ally issue repos fall back to the matching `allies.yaml` checkout when they are not in `repos.yaml`. After an interactive selected triage session exits successfully, War Room checks for a new issue comment starting `## War Room triage notes` with `Ready for ready-to-engage: yes`; only then does it move the Campaign status to `ready-to-engage` and replace the workflow label. Direct `--issue --launch` handoffs still require `--mark-ready --confirm-status` for that closeout. The command ends with an explicit `Outcome:` line for completed, dry-run, blocked, or not-ready handoffs.
+In an interactive terminal, `issue triage` prints numbered `needs-triage` Campaign Map items and lets you choose one to launch the scoped triage handoff in the Codex TUI, so `@grill-me` questions can be answered directly. Triage handoffs are planning-only: they may do read-only investigation, ask questions, and post final triage notes back to the GitHub issue, but must not edit code, create branches, commit, or open PRs. If the issue references Sentry, the handoff instructs Codex to use the Sentry MCP to inspect safely and create or verify the GitHub-to-Sentry issue link, then include a `Sentry link:` status line in the triage notes. War Room starts Codex with workspace-write sandboxing plus outbound network access for read-only API checks. Add `--dry-run` to preview the selected handoff without launching. With `--issue`, it builds that handoff directly with repo specialist context and previews by default unless `--launch` is passed. Ally issue repos fall back to the matching `allies.yaml` checkout when they are not in `repos.yaml`. After an interactive selected triage session exits successfully, War Room checks for a new issue comment starting `## War Room triage notes` with `Ready for ready-to-engage: yes`; only then does it move the Campaign status to `ready-to-engage` and replace the workflow label. Direct `--issue --launch` handoffs still require `--mark-ready --confirm-status` for that closeout. The command ends with an explicit `Outcome:` line for completed, dry-run, blocked, or not-ready handoffs.
 
 4. Start implementation from the ready issue.
 
@@ -156,7 +156,24 @@ warroom pr merge
 warroom pr merge --issue "$ISSUE" --confirm
 ```
 
-`pr merge` explains merge-readiness blockers, requested reviewers, unresolved review threads, and check state. It resolves the linked issue from branch metadata or the PR body closing line when `--issue` is omitted, which keeps ally-source issue summaries and Campaign status updates pointed at the source issue. Without `--confirm`, an interactive preflight asks whether to continue into the confirmed merge path. If the preflight is blocked, type `skip` to allow unresolved review threads only when no other blockers remain. If the preflight is clear, type `skip` to continue the merge while skipping the demo Playwright gate. A confirmed merge first reruns merge readiness. For repos with `merge.playwright: true` in `repos.yaml`, it then runs the required demo Playwright `test:e2e` gate against the local backend API unless the clear-preflight skip choice was used, printing backend readiness progress and streaming the Playwright command output in the terminal. Repos with `merge.playwright: false` skip that backend/demo gate. If `merge.changelog: true`, War Room waits for base-branch GitHub Actions after merge, pulls the latest files, asks the LLM to update `CHANGELOG.md`, and pushes a `[skip-ci]` changelog commit to the base branch. Once the PR is merged and the closeout gates are clear, War Room posts a short victory update to the linked issue unless `--no-issue-comment` is used. After a successful interactive merge, War Room prompts to post the fuller victory summary and then prompts for local cleanup, which switches to the PR base branch and pulls it with `git pull --ff-only`.
+`pr merge` explains merge-readiness blockers, requested reviewers, unresolved review threads, and check state. It resolves the linked issue from branch metadata or the PR body closing line when `--issue` is omitted, which keeps ally-source issue summaries and Campaign status updates pointed at the source issue. Without `--confirm`, an interactive preflight asks whether to continue into the confirmed merge path. If the preflight is blocked, type `skip` to allow unresolved review threads only when no other blockers remain. If the preflight is clear, type `skip` to continue the merge while skipping the demo Playwright gate. A confirmed merge first reruns merge readiness. For repos with `merge.playwright: true` in `repos.yaml`, it then runs the required demo Playwright `test:e2e` gate against the local backend API unless the clear-preflight skip choice was used, printing backend readiness progress and streaming the Playwright command output in the terminal. Repos with `merge.playwright: false` skip that backend/demo gate. If `merge.changelog: true`, War Room waits for base-branch GitHub Actions after merge, pulls the latest files, asks the LLM to update `CHANGELOG.md`, and pushes a `[skip-ci]` changelog commit to the base branch. Once the PR is merged and the closeout gates are clear, War Room posts a short victory update to the linked issue unless `--no-issue-comment` is used. After a successful merge, War Room prints the issue's War Room LLM usage summary from `.warroom/runs/issues/<issue>/usage-ledger.json`. After a successful interactive merge, War Room prompts to post the fuller victory summary and then prompts for local cleanup, which switches to the PR base branch and pulls it with `git pull --ff-only`.
+
+## LLM Usage Tracking
+
+War Room records issue-attributed LLM adapter usage automatically. The canonical ledger is keyed by the source GitHub issue, so ally issues keep the same usage total even when implementation happens in a mapped product repo:
+
+```text
+.warroom/runs/issues/TeamFloPay__ally-clicktech__6/usage-ledger.json
+.warroom/runs/issues/TeamFloPay__ally-clicktech__6/usage-summary.md
+```
+
+The ledger stores metadata, token counts, estimates, and cost fields only; it does not store prompts or model output. `codex exec` output is captured while still being shown in the terminal where possible, so War Room can parse adapter-reported token totals when present. Otherwise it records prompt/output token estimates and marks the entry as estimated. Interactive Codex TUI sessions record prompt estimates and leave output unknown.
+
+Pricing is read from `config/llm-pricing.json`. Missing rates are reported as `Cost: unavailable` rather than treated as zero. Inspect current usage before merge with:
+
+```sh
+warroom issue usage --issue "$ISSUE"
+```
 
 If work becomes blocked, mark it explicitly:
 
@@ -183,6 +200,7 @@ npm run warroom -- maps assign --check
 npm run warroom -- issue create
 npm run warroom -- issue triage
 npm run warroom -- issue next
+npm run warroom -- issue usage --issue "$ISSUE"
 npm run warroom -- abort --print-recovery
 npm run warroom -- dev status
 ```

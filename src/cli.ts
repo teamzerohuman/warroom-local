@@ -45,6 +45,7 @@ import {
 } from './commands/pr.js';
 import { runSync, type SyncResult } from './commands/sync.js';
 import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
+import { formatLlmUsageSummary, summarizeIssueUsage, type LlmUsageSummary } from './lib/llm-usage.js';
 import { runGit } from './lib/repos.js';
 import { findWarRoomWorkspace } from './lib/workspace.js';
 
@@ -58,8 +59,16 @@ type BuildProgramOptions = {
   interactive?: boolean;
 };
 
+const OUTCOME_SEPARATOR = '-----------------------------------------';
+
 function printJson(output: Output, value: unknown) {
   output(JSON.stringify(value, null, 2));
+}
+
+function printOutcome(output: Output, outcome: string) {
+  output(OUTCOME_SEPARATOR);
+  output(outcome);
+  output(OUTCOME_SEPARATOR);
 }
 
 function printNotImplemented(output: Output, command: string, issue: string) {
@@ -306,7 +315,7 @@ function printIssueHandoff(output: Output, result: IssueHandoffResult, options: 
   }
   if (result.closeoutError) output(`triage closeout error: ${result.closeoutError}`);
   output(result.prompt);
-  if (!options.suppressOutcome) output(issueTriageOutcome(result));
+  if (!options.suppressOutcome) printOutcome(output, issueTriageOutcome(result));
 }
 
 function issueTriageOutcome(result: IssueHandoffResult) {
@@ -395,7 +404,7 @@ function printIssueCreate(output: Output, result: IssueCreateResult) {
     if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
   }
   if (result.closeoutError) output(`issue closeout error: ${result.closeoutError}`);
-  output(issueCreateOutcome(result));
+  printOutcome(output, issueCreateOutcome(result));
 }
 
 function issueStartOutcome(result: PrPlanResult) {
@@ -565,8 +574,14 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
   }
   output(result.prompt);
+  printLlmUsage(output, result.usageSummary);
   const outcome = issueStartOutcome(result) ?? prReviewOutcome(result);
-  if (outcome) output(outcome);
+  if (outcome) printOutcome(output, outcome);
+}
+
+function printLlmUsage(output: Output, summary: LlmUsageSummary | null | undefined) {
+  if (!summary) return;
+  for (const line of formatLlmUsageSummary(summary)) output(line);
 }
 
 function printPrCreate(output: Output, result: PrCreateResult) {
@@ -607,9 +622,12 @@ function printPrCreate(output: Output, result: PrCreateResult) {
   if (result.created && result.url) {
     output(`PR URL: ${result.url}`);
   } else if (result.blocked.length > 0) {
-    output('Outcome: PR not created. Resolve the blocked items above, then rerun `warroom pr create --confirm`.');
+    printOutcome(output, 'Outcome: PR not created. Resolve the blocked items above, then rerun `warroom pr create --confirm`.');
   } else {
-    output('Outcome: PR not created. This was a preflight; run `warroom pr create --confirm` or answer yes in an interactive terminal to push and create the PR.');
+    printOutcome(
+      output,
+      'Outcome: PR not created. This was a preflight; run `warroom pr create --confirm` or answer yes in an interactive terminal to push and create the PR.'
+    );
   }
 }
 
@@ -689,9 +707,10 @@ function printPrReviewQueue(output: Output, result: PrReviewQueueResult, options
   });
   if (options.suppressOutcome) return;
   if (result.prs.length === 0) {
-    output(`Outcome: no open PRs found for Campaign statuses ${result.statuses.join(', ')}.`);
+    printOutcome(output, `Outcome: no open PRs found for Campaign statuses ${result.statuses.join(', ')}.`);
   } else {
-    output(
+    printOutcome(
+      output,
       `Outcome: listed ${result.prs.length} PR${result.prs.length === 1 ? '' : 's'} ready for review; no LLM handoff was launched. Run \`warroom pr review --pr <owner/repo#number> --launch\` to start one.`
     );
   }
@@ -879,7 +898,8 @@ async function promptPrCreateAfterIssueStart(
 
   if (readiness && !readiness.ready) {
     output(`PR create is not ready: ${readiness.blocker ?? 'branch is not ready for PR creation.'}`);
-    output(
+    printOutcome(
+      output,
       `Outcome: PR create was not offered. Commit the implementation on ${readiness.branch}, then rerun \`warroom pr create\`.`
     );
     return;
@@ -1358,7 +1378,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         const confirmed = await promptConfirmation(output, input, 'Create this GitHub issue now? [y/N]');
         if (!confirmed) {
           output('Issue not created.');
-          output('Outcome: issue not created. Draft remains available for review.');
+          printOutcome(output, 'Outcome: issue not created. Draft remains available for review.');
           return;
         }
 
@@ -1372,6 +1392,19 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .description('Post-MVP quality/refactor issue creation flow.')
     .action(() => output('warroom issue fortify is deferred from the MVP and tracked in TeamFloPay/infra#7.'));
   issue
+    .command('usage')
+    .description('Print War Room LLM usage tracked for an issue.')
+    .requiredOption('--issue <owner/repo#number>', 'Issue to summarize.')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { issue: string; json?: boolean }) => {
+      const summary = summarizeIssueUsage(workspaceRoot, opts.issue);
+      if (opts.json) {
+        printJson(output, summary);
+        return;
+      }
+      printLlmUsage(output, summary);
+    });
+  issue
     .command('triage')
     .description('List triage issues or create a scoped LLM triage handoff for one issue.')
     .option('--issue <owner/repo#number>', 'Issue to triage.')
@@ -1379,60 +1412,33 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--mark-ready', 'Preview or move the issue to ready-to-engage after triage.')
     .option('--confirm-status', 'Apply the Campaign Map status movement requested by --mark-ready.')
     .option('--dry-run', 'Print the structured handoff without launching the configured LLM adapter.')
-    .option('--launch', 'Launch the configured LLM adapter. Direct issue handoffs default to dry-run output.')
+    .option('--launch', 'Compatibility option; issue triage launches by default unless --dry-run is passed.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--no-select', 'List issues without prompting for a selection.')
     .option('--json', 'Print machine-readable output.')
     .action(async (opts: { issue?: string; label?: string; markReady?: boolean; confirmStatus?: boolean; dryRun?: boolean; launch?: boolean; writeArtifact?: boolean; select?: boolean; json?: boolean }) => {
-      const triageDryRun = (selectedInteractively: boolean) =>
-        opts.dryRun === true ? true : selectedInteractively ? false : !opts.launch;
+      const triageDryRun = () => opts.dryRun === true;
       const runTriage = (issueRef?: string, selectedInteractively = false) => {
-        const dryRun = triageDryRun(selectedInteractively);
+        const dryRun = triageDryRun();
         return runIssueTriage(workspaceRoot, {
           issue: issueRef,
           label: opts.label,
-          markReady: opts.markReady || selectedInteractively,
-          confirmStatus: dryRun ? false : opts.confirmStatus || selectedInteractively,
+          markReady: dryRun ? opts.markReady : opts.markReady || selectedInteractively || Boolean(issueRef),
+          confirmStatus: dryRun ? false : opts.confirmStatus || selectedInteractively || Boolean(issueRef),
           dryRun,
           writeArtifact: opts.writeArtifact,
         });
       };
 
+      if (opts.issue && !opts.json && opts.dryRun !== true) output(`Triaging ${opts.issue}`);
       const result = runTriage(opts.issue);
       if (opts.json) {
         printJson(output, result);
         return;
       }
       if (!('issues' in result)) {
-        const canLaunchAfterPreview =
-          Boolean(opts.issue) && interactive && opts.dryRun !== true && opts.launch !== true && !result.launched && !result.launchError;
-        printIssueHandoff(output, result, { suppressOutcome: canLaunchAfterPreview });
-        if (canLaunchAfterPreview && opts.issue) {
-          const launch = await promptConfirmation(
-            output,
-            input,
-            `Start issue triage handoff for ${opts.issue} now? This will run \`warroom issue triage --issue ${opts.issue} --launch --mark-ready --confirm-status\`. [y/N]`
-          );
-          if (!launch) {
-            output('Outcome: no issue triage handoff started.');
-            return;
-          }
-
-          output(`Triaging ${opts.issue}`);
-          const launched = runIssueTriage(workspaceRoot, {
-            issue: opts.issue,
-            label: opts.label,
-            markReady: true,
-            confirmStatus: true,
-            dryRun: false,
-            writeArtifact: opts.writeArtifact,
-          });
-          if ('issues' in launched) printIssueList(output, launched);
-          else {
-            printIssueHandoff(output, launched);
-            await promptIssueNextAfterTriage(workspaceRoot, output, input, opts.issue, launched);
-          }
-        }
+        printIssueHandoff(output, result);
+        if (opts.issue) await promptIssueNextAfterTriage(workspaceRoot, output, input, opts.issue, result);
         return;
       }
 
@@ -1445,14 +1451,14 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             'Selection is available in an interactive terminal. Run warroom issue triage --issue <owner/repo#number> to triage one directly.'
           );
         }
-        output(result.issues.length === 0 ? 'Outcome: no triage issues found; no issue selected.' : 'Outcome: no issue selected.');
+        printOutcome(output, result.issues.length === 0 ? 'Outcome: no triage issues found; no issue selected.' : 'Outcome: no issue selected.');
         return;
       }
 
       const selected = await promptIssueSelection(output, input, result.issues, 'triage');
       if (!selected) {
         output('No issue selected.');
-        output('Outcome: no issue selected.');
+        printOutcome(output, 'Outcome: no issue selected.');
         return;
       }
 
@@ -1531,14 +1537,14 @@ export function buildProgram(options: BuildProgramOptions = {}) {
               'Selection is available in an interactive terminal. Run warroom issue next --issue <owner/repo#number> to start one directly.'
             );
           }
-          output(result.issues.length === 0 ? 'Outcome: no ready issues found; no issue started.' : 'Outcome: no issue started.');
+          printOutcome(output, result.issues.length === 0 ? 'Outcome: no ready issues found; no issue started.' : 'Outcome: no issue started.');
           return;
         }
 
         const selected = await promptIssueSelection(output, input, result.issues);
         if (!selected) {
           output('No issue selected.');
-          output('Outcome: no issue started.');
+          printOutcome(output, 'Outcome: no issue started.');
           return;
         }
 
@@ -1682,7 +1688,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           try {
             inferredPr = inferPrRefForCurrentBranch(workspaceRoot, invocationCwd);
           } catch {
-            output(`Outcome: no open PRs found for Campaign statuses ${result.statuses.join(', ')} or the current branch.`);
+            printOutcome(output, `Outcome: no open PRs found for Campaign statuses ${result.statuses.join(', ')} or the current branch.`);
             return;
           }
 
@@ -1695,7 +1701,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
               `Start PR review handoff for ${inferredPr} now? This will run \`warroom pr review --pr ${inferredPr} --launch\`. [y/N]`
             );
             if (!launch) {
-              output('Outcome: no PR review handoff started.');
+              printOutcome(output, 'Outcome: no PR review handoff started.');
               return;
             }
           }
@@ -1717,7 +1723,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
         const selected = await promptPrReviewSelection(output, input, result.prs);
         if (!selected) {
-          output('Outcome: no PR review handoff started.');
+          printOutcome(output, 'Outcome: no PR review handoff started.');
           return;
         }
 
