@@ -160,6 +160,11 @@ function claudePermissionMode(
   return claudeEnvValue(local, example, key, 'acceptEdits');
 }
 
+export function readWorkspaceEnvVar(workspaceRoot: string, key: string): string | null {
+  const localPath = path.join(workspaceRoot, '.env.local');
+  return readEnvMap(localPath).get(key) ?? null;
+}
+
 export function getEnvStatus(workspaceRoot: string): EnvStatus {
   const examplePath = path.join(workspaceRoot, '.env.local.example');
   const localPath = path.join(workspaceRoot, '.env.local');

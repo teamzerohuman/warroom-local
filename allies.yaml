@@ -16,3 +16,10 @@ allies:
       - allies/clicktech/README.md
       - allies/clicktech/docs/operating-brief.md
       - allies/clicktech/docs/issue-sync.md
+    comms:
+      - type: slack
+        channels:
+          - ally-clicktech-slt
+          - ally-clicktech-omni
+          - ally-clicktech-hub
+          - ally-clicktech-funnels

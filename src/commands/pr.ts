@@ -277,6 +277,7 @@ export type PrCreateResult = {
   pushCommand: string | null;
   createCommand: string;
   created: boolean;
+  existingPr: boolean;
   url: string | null;
   blocked: string[];
   campaignStatus: CampaignStatusSetResult | null;
@@ -2469,9 +2470,9 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     ['pr', 'list', '--repo', repo.github, '--state', 'open', '--head', branch, '--json', 'number,url', '--limit', '10'],
     []
   );
-  if (existingPrs.length > 0) {
-    blocked.push(`Open PR already exists for ${branch}: ${existingPrs[0]?.url ?? `${repo.github}#${existingPrs[0]?.number}`}.`);
-  }
+  const existingPrUrl = existingPrs.length > 0
+    ? (existingPrs[0]?.url ?? `https://github.com/${repo.github}/pull/${existingPrs[0]?.number}`)
+    : null;
 
   const shouldPush = options.push !== false;
   const pushArgs = shouldPush
@@ -2530,31 +2531,37 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
 
   if (options.confirm) {
     if (blocked.length > 0) throw new Error(blocked.join(' '));
-    if (pushArgs) {
-      const push = spawnSync('git', pushArgs, { cwd: repo.resolvedPath, stdio: 'inherit' });
-      if (push.status !== 0) throw new Error(`${pushCommand} failed with exit ${push.status ?? 'unknown'}.`);
-      pushed = true;
-    }
+    if (existingPrUrl) {
+      url = existingPrUrl;
+    } else {
+      if (pushArgs) {
+        const push = spawnSync('git', pushArgs, { cwd: repo.resolvedPath, stdio: 'inherit' });
+        if (push.status !== 0) throw new Error(`${pushCommand} failed with exit ${push.status ?? 'unknown'}.`);
+        pushed = true;
+      }
 
-    const createdPr = spawnSync('gh', createArgs, { cwd: repo.resolvedPath, encoding: 'utf8' });
-    if (createdPr.status !== 0) {
-      throw new Error(createdPr.stderr.trim() || `gh pr create failed with exit ${createdPr.status ?? 'unknown'}.`);
+      const createdPr = spawnSync('gh', createArgs, { cwd: repo.resolvedPath, encoding: 'utf8' });
+      if (createdPr.status !== 0) {
+        throw new Error(createdPr.stderr.trim() || `gh pr create failed with exit ${createdPr.status ?? 'unknown'}.`);
+      }
+      const createdOutput = createdPr.stdout.trim();
+      const createdUrl = createdOutput.match(/https:\/\/github\.com\/\S+/)?.[0] ?? null;
+      if (!createdUrl) {
+        throw new Error(`gh pr create completed but did not return a PR URL. Output: ${createdOutput || '(empty)'}`);
+      }
+      created = true;
+      url = createdUrl;
     }
-    const createdOutput = createdPr.stdout.trim();
-    const createdUrl = createdOutput.match(/https:\/\/github\.com\/\S+/)?.[0] ?? null;
-    if (!createdUrl) {
-      throw new Error(`gh pr create completed but did not return a PR URL. Output: ${createdOutput || '(empty)'}`);
-    }
-    created = true;
-    url = createdUrl;
   }
 
+  const prResolved = created || Boolean(existingPrUrl && options.confirm);
   const campaignStatus = issueRef
-    ? setCampaignStatus(issueRef, 'skirmish', { confirm: Boolean(options.confirm && options.confirmStatus && created) })
+    ? setCampaignStatus(issueRef, 'skirmish', { confirm: Boolean(options.confirm && options.confirmStatus && prResolved) })
     : null;
   const labelUpdate = issueRef
-    ? setIssueWorkflowLabel(issueRef, 'skirmish', Boolean(options.confirm && options.confirmStatus && created))
+    ? setIssueWorkflowLabel(issueRef, 'skirmish', Boolean(options.confirm && options.confirmStatus && prResolved))
     : null;
+  const existingPr = Boolean(existingPrUrl && options.confirm);
   const baseResult: Omit<PrCreateResult, 'artifact' | 'issueComment'> = {
     action: 'create',
     repo: repo.github,
@@ -2569,6 +2576,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     pushCommand,
     createCommand,
     created,
+    existingPr,
     url,
     blocked,
     campaignStatus,
@@ -2577,7 +2585,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
   };
   const issueComment = buildPrCreateIssueCommentResult(
     issueRef,
-    created,
+    prResolved,
     options.issueComment,
     buildPrCreateIssueCommentBody(baseResult)
   );

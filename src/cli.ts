@@ -47,8 +47,19 @@ import {
   type SummaryPostResult,
   type VersionBumpChoice,
 } from './commands/pr.js';
+import {
+  buildSlackBlocks,
+  postToSlack,
+  reviseChangelogContent,
+  runChangelogShare,
+  PERIOD_LABEL,
+  type ChangelogPeriod,
+  type ChangelogShareResult,
+  type SlackPostResult,
+} from './commands/changelog-share.js';
 import { runSync, type SyncResult } from './commands/sync.js';
 import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
+import { readWorkspaceEnvVar } from './lib/env.js';
 import { formatLlmUsageSummary, refreshIssueUsageLedgerCosts, summarizeIssueUsage, type LlmUsageSummary } from './lib/llm-usage.js';
 import { runGit } from './lib/repos.js';
 import { findWarRoomWorkspace } from './lib/workspace.js';
@@ -232,6 +243,21 @@ async function promptConfirmation(output: Output, input: Input, question: string
   }
 
   return false;
+}
+
+async function promptText(output: Output, input: Input, question: string): Promise<string> {
+  output(question);
+  // readline.close() pauses stdin; resume it so the next interface can read
+  (input as NodeJS.ReadStream).resume?.();
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of readline) {
+      return line.trim();
+    }
+  } finally {
+    readline.close();
+  }
+  return '';
 }
 
 async function promptMergeConfirmation(output: Output, input: Input, question: string): Promise<'confirm' | 'skip' | 'cancel'> {
@@ -678,7 +704,7 @@ function printLlmUsage(output: Output, summary: LlmUsageSummary | null | undefin
 }
 
 function printPrCreate(output: Output, result: PrCreateResult) {
-  output(`PR create: ${result.created ? 'created' : 'preflight only'}`);
+  output(`PR create: ${result.created ? 'created' : result.existingPr ? 'existing PR reused' : 'preflight only'}`);
   output(`Repo: ${result.repo}`);
   output(`Path: ${result.path}`);
   output(`Branch: ${result.branch} -> ${result.base}`);
@@ -712,7 +738,7 @@ function printPrCreate(output: Output, result: PrCreateResult) {
     if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
   }
   output(result.body);
-  if (result.created && result.url) {
+  if ((result.created || result.existingPr) && result.url) {
     output(`PR URL: ${result.url}`);
   } else if (result.blocked.length > 0) {
     printOutcome(output, 'Outcome: PR not created. Resolve the blocked items above, then rerun `warroom pr create --confirm`.');
@@ -1173,7 +1199,7 @@ async function promptPrReviewAfterPrCreate(
   result: PrCreateResult,
   options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput }
 ) {
-  if (!result.created) return;
+  if (!result.created && !result.existingPr) return;
   const prRef = prRefFromCreateResult(result);
   if (!prRef) return;
 
@@ -1997,7 +2023,15 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
 
-      const dryRun = opts.dryRun ?? !opts.launch;
+      let launch = opts.launch === true;
+      if (!launch && !opts.dryRun && interactive && !opts.json) {
+        launch = await promptConfirmation(
+          output,
+          input,
+          `Launch PR review handoff for ${opts.pr} now? [y/N]`
+        );
+      }
+      const dryRun = opts.dryRun === true ? true : !launch;
       const result = await runPrReview(workspaceRoot, {
         pr: opts.pr,
         issue: opts.issue ?? inferIssueRefForCurrentBranch(workspaceRoot, invocationCwd) ?? undefined,
@@ -2281,6 +2315,152 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       printDevAction(output, result);
+    });
+
+  const changelog = program.command('changelog').description('Changelog distribution commands.');
+  changelog
+    .command('share')
+    .description('Generate and distribute changelog updates to ally Slack channels.')
+    .option('--period <period>', 'Reporting period: day, week, or month. Prompted interactively if omitted.')
+    .action(async (opts: { period?: string }) => {
+      const validPeriods: ChangelogPeriod[] = ['day', 'week', 'month'];
+
+      let period: ChangelogPeriod;
+      if (opts.period && (validPeriods as string[]).includes(opts.period)) {
+        period = opts.period as ChangelogPeriod;
+      } else if (opts.period) {
+        output(`Invalid period "${opts.period}". Must be day, week, or month.`);
+        process.exitCode = 1;
+        return;
+      } else if (interactive) {
+        const answer = await new Promise<string>((resolve) => {
+          output('Select reporting period (day/week/month) [week]: ');
+          const rl = createInterface({ input });
+          rl.once('line', (line) => { rl.close(); resolve(line.trim().toLowerCase()); });
+          rl.once('close', () => resolve(''));
+        });
+        period = (validPeriods as string[]).includes(answer) ? (answer as ChangelogPeriod) : 'week';
+      } else {
+        period = 'week';
+      }
+
+      output(`Loading ${PERIOD_LABEL[period].toLowerCase()} changelog entries...`);
+      const result = runChangelogShare(workspaceRoot, period);
+
+      if (result.error) {
+        printOutcome(output, `Outcome: ${result.error}`);
+        return;
+      }
+
+      output(`Found ${result.entries.length} entr${result.entries.length === 1 ? 'y' : 'ies'}:`);
+      for (const entry of result.entries) output(`  ${entry.repoName}: ${entry.title}`);
+
+      if (result.adapterError) {
+        output(`Adapter error: ${result.adapterError}`);
+        printOutcome(output, 'Outcome: changelog share failed — LLM adapter could not generate message content.');
+        process.exitCode = 1;
+        return;
+      }
+      if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
+
+      const slackToken = readWorkspaceEnvVar(workspaceRoot, 'SLACK_BOT_TOKEN') ?? process.env.SLACK_BOT_TOKEN ?? '';
+      if (!slackToken) {
+        output('SLACK_BOT_TOKEN is not set. Add it to .env.local and try again.');
+        printOutcome(output, 'Outcome: changelog share failed — missing SLACK_BOT_TOKEN.');
+        process.exitCode = 1;
+        return;
+      }
+
+      output('Posting draft to #changelog-review...');
+      const reviewPost: SlackPostResult = await postToSlack(
+        slackToken,
+        'changelog-review',
+        result.blocks!,
+        result.fallbackText!
+      );
+      if (!reviewPost.ok) {
+        output(`Failed to post to #changelog-review: ${reviewPost.error ?? 'unknown error'}`);
+        printOutcome(output, 'Outcome: changelog share failed — could not post draft to #changelog-review.');
+        process.exitCode = 1;
+        return;
+      }
+      output('Draft posted to #changelog-review. Check Slack to review the message.');
+
+      if (!interactive) {
+        printOutcome(output, 'Outcome: draft posted to #changelog-review. Run interactively to approve and distribute to ally channels.');
+        return;
+      }
+
+      // Feedback loop — keep revising until the user is happy or declines edits
+      let currentResult: ChangelogShareResult = result;
+      let currentBlocks = result.blocks!;
+      let currentFallbackText = result.fallbackText!;
+
+      while (true) {
+        const wantsEdits = await promptConfirmation(output, input, 'Draft sent to Slack. Would you like to make edits? [y/N]');
+        if (!wantsEdits) break;
+
+        const feedbackText = await promptText(output, input, 'Describe the changes you\'d like (e.g. "shorter intro", "more casual tone"):');
+
+        if (!feedbackText) {
+          output('No feedback entered — moving on.');
+          break;
+        }
+
+        output('Regenerating with your feedback...');
+        const revision = reviseChangelogContent(workspaceRoot, currentResult, feedbackText);
+
+        if (revision.adapterError || !revision.blocks) {
+          output(`Adapter error: ${revision.adapterError ?? 'no content returned'}`);
+          output('Keeping previous draft.');
+          break;
+        }
+
+        // Merge revised content back so further revisions have the latest version
+        currentResult = { ...currentResult, content: revision.content, blocks: revision.blocks, fallbackText: revision.fallbackText };
+        currentBlocks = revision.blocks;
+        currentFallbackText = revision.fallbackText!;
+
+        output('Posting revised draft to #changelog-review...');
+        const repost = await postToSlack(slackToken, 'changelog-review', currentBlocks, currentFallbackText);
+        if (!repost.ok) {
+          output(`Failed to re-post to #changelog-review: ${repost.error ?? 'unknown error'}`);
+          break;
+        }
+        output('Revised draft posted to #changelog-review.');
+      }
+
+      const finalConfirm = await promptConfirmation(output, input, 'Are you sure you\'re ready to share this changelog with your allies? [y/N]');
+      if (!finalConfirm) {
+        printOutcome(output, 'Outcome: draft posted to #changelog-review. Ally distribution cancelled at final confirmation.');
+        return;
+      }
+
+      if (result.alliesWithComms.length === 0) {
+        output('No allies with Slack comms configured in allies.yaml.');
+        printOutcome(output, 'Outcome: draft approved but no ally comms configured — nothing distributed.');
+        return;
+      }
+
+      let successCount = 0;
+      let failCount = 0;
+      for (const ally of result.alliesWithComms) {
+        for (const channel of ally.channels) {
+          const post = await postToSlack(slackToken, channel, currentBlocks, currentFallbackText);
+          if (post.ok) {
+            output(`Posted to #${channel} (${ally.allyName})`);
+            successCount++;
+          } else {
+            output(`Failed to post to #${channel} (${ally.allyName}): ${post.error ?? 'unknown error'}`);
+            failCount++;
+          }
+        }
+      }
+
+      printOutcome(
+        output,
+        `Outcome: changelog distributed to ${successCount} channel${successCount === 1 ? '' : 's'}${failCount > 0 ? `; ${failCount} failed — check output above` : ''}.`
+      );
     });
 
   return program;

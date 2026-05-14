@@ -6,7 +6,7 @@ defaults:
   local_root: maps/repos
 repos:
   - id: sdk
-    name: sdk
+    name: SDK
     github: TeamFloPay/sdk
     ssh_url: git@github.com:TeamFloPay/sdk.git
     local_path: maps/repos/sdk
@@ -40,7 +40,7 @@ repos:
           - npm-docs
           - typescript-docs
   - id: backend
-    name: backend
+    name: Backend
     github: TeamFloPay/backend
     ssh_url: git@github.com:TeamFloPay/backend.git
     local_path: maps/repos/backend

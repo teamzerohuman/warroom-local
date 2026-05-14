@@ -18,6 +18,11 @@ const AllyEnvSchema = z.object({
   local: z.string(),
 });
 
+const AllyCommsSchema = z.object({
+  type: z.literal('slack'),
+  channels: z.array(z.string()),
+});
+
 const AllySchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -26,6 +31,7 @@ const AllySchema = z.object({
   issue_repo: AllyIssueRepoSchema,
   env: AllyEnvSchema,
   docs: z.array(z.string()).default([]),
+  comms: z.array(AllyCommsSchema).optional(),
 });
 
 const AlliesManifestSchema = z.object({
