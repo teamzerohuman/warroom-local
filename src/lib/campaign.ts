@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import { parseRepoRef } from './refs.js';
 import { type RepoManifest } from './repos.js';
 
 export const CAMPAIGN_OWNER = 'TeamFloPay';
@@ -193,9 +194,8 @@ export function checkCampaignStatusOptions(): CampaignStatusReport {
 }
 
 export function parseIssueRef(value: string) {
-  const match = value.match(/^([^#]+)#(\d+)$/);
-  if (!match) throw new Error('Issue references must use owner/repo#number, for example TeamFloPay/infra#4.');
-  return { repo: match[1], number: Number(match[2]), label: value };
+  const ref = parseRepoRef(value);
+  return { ...ref, label: `${ref.repo}#${ref.number}` };
 }
 
 function projectItemForIssue(issue: string) {

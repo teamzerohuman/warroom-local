@@ -7,6 +7,7 @@ import { CAMPAIGN_LABELS, listCampaignIssuesByStatus, setCampaignStatus, type Ca
 import { getInteractiveAdapterInvocation, runInteractiveAdapter } from '../lib/env.js';
 import { ownerRepoFromText } from '../lib/issue-links.js';
 import { attachRunUsageToIssue, createUsageCommandRunId } from '../lib/llm-usage.js';
+import { parseRepoRef } from '../lib/refs.js';
 import { getRepoHealth, loadRepoManifest } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 
@@ -147,9 +148,7 @@ function ghJson<T>(args: string[], fallback: T): T {
 }
 
 export function parseIssueRef(value: string): IssueRef {
-  const match = value.match(/^([^#]+)#(\d+)$/);
-  if (!match) throw new Error('Issue references must use owner/repo#number, for example TeamFloPay/infra#4.');
-  return { repo: match[1], number: Number(match[2]) };
+  return parseRepoRef(value);
 }
 
 function labelsFromGh(labels: Array<{ name?: string }>) {

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { getAdapterInvocation, runAdapter } from '../lib/env.js';
 import { createUsageCommandRunId, usageEntriesForCommandRun } from '../lib/llm-usage.js';
+import { parseRepoRef } from '../lib/refs.js';
 import { getRepoById, getRepoHealth, loadRepoManifest, runGit, type RepoHealth } from '../lib/repos.js';
 
 export type CommitCreateOptions = {
@@ -166,8 +167,12 @@ function currentBranchIssueRef(repo: string, branch: string | null, repoPath: st
 
 function inferRepoFromIssue(repos: RepoHealth[], issue: string | undefined) {
   if (!issue) return null;
-  const parts = issueRefParts(issue);
-  if (!parts) return null;
+  let parts: { repo: string; number: number };
+  try {
+    parts = parseRepoRef(issue);
+  } catch {
+    return null;
+  }
   return singleRepoId(repos.filter((repo) => repo.github === parts.repo), `issue ${issue}`);
 }
 
@@ -337,25 +342,21 @@ function markdownSummary(result: Omit<CommitCreateResult, 'artifact'>) {
   return lines.join('\n');
 }
 
-function issueRefParts(issue: string) {
-  const match = issue.match(/^([^#]+)#(\d+)$/);
-  if (!match) return null;
-  return { repo: match[1]!, number: match[2]! };
-}
-
 function postIssueProgressComment(issue: string, body: string): IssueProgressCommentResult {
-  const ref = issueRefParts(issue);
-  if (!ref) {
+  let ref: { repo: string; number: number };
+  try {
+    ref = parseRepoRef(issue);
+  } catch (error) {
     return {
       issue,
       applied: false,
       url: null,
       reason: null,
-      error: `Invalid issue reference ${issue}. Expected owner/repo#number.`,
+      error: error instanceof Error ? error.message : String(error),
     };
   }
 
-  const result = spawnSync('gh', ['issue', 'comment', ref.number, '--repo', ref.repo, '--body', body], { encoding: 'utf8' });
+  const result = spawnSync('gh', ['issue', 'comment', String(ref.number), '--repo', ref.repo, '--body', body], { encoding: 'utf8' });
   if (result.status !== 0) {
     return {
       issue,

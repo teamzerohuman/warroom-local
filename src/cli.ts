@@ -61,6 +61,7 @@ import { runSync, type SyncResult } from './commands/sync.js';
 import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
 import { readWorkspaceEnvVar } from './lib/env.js';
 import { formatLlmUsageSummary, refreshIssueUsageLedgerCosts, summarizeIssueUsage, type LlmUsageSummary } from './lib/llm-usage.js';
+import { pickCommandPath } from './lib/interactive-menu.js';
 import { runGit } from './lib/repos.js';
 import { findWarRoomWorkspace } from './lib/workspace.js';
 
@@ -2461,10 +2462,17 @@ if (currentFile === invokedFile) {
     if (error.code === 'EPIPE') process.exit(0);
     throw error;
   });
-  buildProgram()
-    .parseAsync(process.argv.map((arg) => (arg === '-help' ? '--help' : arg)))
-    .catch((error: unknown) => {
-      console.error(error instanceof Error ? error.message : String(error));
-      process.exit(1);
-    });
+  const program = buildProgram();
+  const userArgs = process.argv.slice(2);
+  const shouldShowMenu = userArgs.length === 0 && Boolean(process.stdin.isTTY) && Boolean(process.stdout.isTTY);
+  const run = shouldShowMenu
+    ? pickCommandPath(program).then((selected) => {
+        if (!selected || selected.length === 0) return undefined;
+        return program.parseAsync(['node', 'warroom', ...selected], { from: 'node' });
+      })
+    : program.parseAsync(process.argv.map((arg) => (arg === '-help' ? '--help' : arg)));
+  run.catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  });
 }

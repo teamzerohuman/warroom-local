@@ -21,6 +21,7 @@ import {
   usageEntriesForCommandRun,
   type LlmUsageSummary,
 } from '../lib/llm-usage.js';
+import { parseRepoRef } from '../lib/refs.js';
 import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 import { parseIssueRef, setIssueWorkflowLabel, type IssueLabelUpdateResult, type IssueRef } from './issues.js';
@@ -523,9 +524,7 @@ function mergePostMergeRequirement(workspaceRoot: string, githubRepo: string): P
 }
 
 function parsePrRef(value: string) {
-  const match = value.match(/^([^#]+)#(\d+)$/);
-  if (!match) throw new Error('PR references must use owner/repo#number, for example TeamFloPay/sdk#12.');
-  return { repo: match[1], number: Number(match[2]) };
+  return parseRepoRef(value);
 }
 
 function truncateText(value: string | undefined, limit = 6000) {
