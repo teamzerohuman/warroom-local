@@ -50,6 +50,7 @@ export type PrOptions = {
   base?: string;
   confirmStatus?: boolean;
   summary?: string;
+  summaryBody?: string;
   postSummary?: boolean;
   confirmSummary?: boolean;
   cleanupLocal?: boolean;
@@ -3872,49 +3873,26 @@ function buildVictorySummary(
   prRef: string,
   issueRef: string | undefined,
   pr: { title?: string; url?: string; headRefName?: string; baseRefName?: string },
-  readiness: MergeReadiness,
-  operatorSummary: string | undefined
+  operatorSummary?: string,
+  mergeChangelog?: MergeChangelogResult
 ) {
-  const defaultOutcome =
-    readiness.blocked.length === 0
-      ? 'Ready for final merge and cleanup through `warroom pr merge`.'
-      : 'Preflight is blocked. Resolve merge-readiness blockers before marking victory.';
   const lines = [
-    '## Victory summary',
-    '',
     `PR: ${prRef}`,
     `Title: ${pr.title ?? 'unknown'}`,
-    `URL: ${pr.url ?? 'unknown'}`,
+    `URL: ${pr.url ?? prRef}`,
     `Branch: ${pr.headRefName ?? 'unknown'} -> ${pr.baseRefName ?? 'unknown'}`,
   ];
 
   if (issueRef) lines.push(`Linked issue: ${issueRef}`);
+  if (operatorSummary) lines.push('', operatorSummary);
 
-  lines.push(
-    '',
-    'Outcome:',
-    operatorSummary ?? defaultOutcome,
-    '',
-    'Merge readiness:',
-    readiness.blocked.length === 0 ? 'No blockers detected by War Room preflight.' : readiness.blocked.map((blocker) => `- ${blocker}`).join('\n'),
-    '',
-    'Merge blocker details:',
-    readiness.details.length === 0
-      ? 'none'
-      : readiness.details
-          .map((detail) => [
-            `- ${detail.blocker}`,
-            `  Why: ${detail.explanation}`,
-            detail.evidence.length ? `  Evidence: ${detail.evidence.join(' ')}` : null,
-            `  Resolve: ${detail.resolution}`,
-          ].filter(Boolean).join('\n'))
-          .join('\n'),
-    '',
-    'Checks:',
-    readiness.checks.length === 0
-      ? 'No status checks were returned by GitHub.'
-      : readiness.checks.map((check) => `- ${check.name}: ${check.state}${check.url ? ` (${check.url})` : ''}`).join('\n')
-  );
+  const releaseNote = mergeChangelog ? readFinalReleaseNote(mergeChangelog) : null;
+  if (releaseNote) {
+    lines.push('', `## ${releaseNote.title ?? 'Public changelog'}`, '', releaseNote.body);
+    if (mergeChangelog?.changelogUrl) lines.push('', `[Read the full changelog](${mergeChangelog.changelogUrl})`);
+  } else if (mergeChangelog?.status === 'passed' && mergeChangelog.changelogUrl) {
+    lines.push('', `[Read the full changelog](${mergeChangelog.changelogUrl})`);
+  }
 
   return lines.join('\n');
 }
@@ -4844,7 +4822,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
       mergePostMerge = mergePostMergeSkipResult(mergePostMerge, 'Skipped by --resume-changelog after PR merge.');
     }
   }
-  const summary = buildVictorySummary(options.pr, issueRef ?? undefined, pr, readiness, options.summary);
+  const preflightSummary = buildVictorySummary(options.pr, issueRef ?? undefined, pr, options.summary);
   const blockerDetails = readiness.details.length
     ? readiness.details
         .map((detail) => [
@@ -4919,7 +4897,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     requiredMergeChecks.join('\n'),
     '',
     'Victory summary:',
-    summary,
+    preflightSummary,
   ].join('\n');
   let merged = options.resumeChangelog === true && pr.state === 'MERGED';
 
@@ -5007,6 +4985,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
   const completionReadiness = completionBlockers.length
     ? { ...readiness, blocked: [...readiness.blocked, ...completionBlockers] }
     : readiness;
+  const summary = resolvedOptions.summaryBody ?? buildVictorySummary(options.pr, issueRef ?? undefined, pr, options.summary, mergeChangelog);
   const summaryPosts = buildSummaryPostPlan(resolvedOptions, summary, completionReadiness);
   const finalIssueComment = buildFinalIssueCommentPlan(
     issueRef ?? null,

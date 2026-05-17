@@ -2948,6 +2948,7 @@ exit 0
         'TeamFloPay/sdk#655',
         '--confirm',
         '--confirm-changelog',
+        '--write-artifact',
       ]);
 
       const output = lines.join('\n');
@@ -2957,6 +2958,17 @@ exit 0
       expect(output).toContain('Changelog file: release-notes/v1.0.1.ready-sdk-pr.md');
       expect(output).toContain('Changelog URL: https://changelog.sdk.flopay.com');
       expect(output).toContain('Changelog version: 1.0.1');
+      const artifactLine = lines.find((line) => line.startsWith('Artifact: '));
+      expect(artifactLine).toBeDefined();
+      const summary = readFileSync(path.join(artifactLine!.slice('Artifact: '.length), 'summary.md'), 'utf8');
+      expect(summary).toContain('PR: TeamFloPay/sdk#655');
+      expect(summary).toContain('Title: Ready SDK PR');
+      expect(summary).toContain('## v1.0.1 - Ready SDK PR');
+      expect(summary).toContain('Ready SDK PR updates the SDK behavior.');
+      expect(summary).toContain('[Read the full changelog](https://changelog.sdk.flopay.com)');
+      expect(summary).not.toContain('Outcome:');
+      expect(summary).not.toContain('Merge readiness:');
+      expect(summary).not.toContain('Checks:');
 
       const remoteNote = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:release-notes/v1.0.1.ready-sdk-pr.md'], {
         encoding: 'utf8',
@@ -2976,6 +2988,77 @@ exit 0
         encoding: 'utf8',
       });
       expect(remoteSubject.stdout.trim()).toBe('docs(changelog): add release notes for 1.0.1 [skip-ci]');
+    } finally {
+      process.env.PATH = originalPath;
+      for (const key of envKeys) {
+        const value = originalEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it('posts prompted victory summaries with the completed OpenChangelog content', async () => {
+    const { root, sdk, sdkRemote } = makeChangelogMergeFixture({ openchangelog: true });
+    const bin = path.join(root, 'bin');
+    const commentLogPath = path.join(root, 'comments.jsonl');
+    mkdirSync(bin, { recursive: true });
+    writeChangelogMergeGhFixture(bin, sdkRemote, { commentLogPath });
+    writeOpenChangelogCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    const envKeys = [
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS',
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS',
+    ] as const;
+    const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS = '0';
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS = '0';
+
+    try {
+      const lines: string[] = [];
+      const input = new PassThrough();
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line), input, interactive: true });
+
+      const answers = ['yes\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync([
+          'node',
+          'warroom',
+          'pr',
+          'merge',
+          '--pr',
+          'TeamFloPay/sdk#655',
+          '--confirm',
+          '--confirm-changelog',
+        ]);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
+
+      expect(lines).toContain('Post victory summary comments now? [Y/n]');
+      expect(lines).toContain('Summary pr: posted TeamFloPay/sdk#655 https://github.com/TeamFloPay/sdk/pull/655#issuecomment-1');
+
+      const comments = readFileSync(commentLogPath, 'utf8')
+        .trim()
+        .split(/\n/)
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { kind: string; body: string });
+      expect(comments).toHaveLength(1);
+      expect(comments[0]?.kind).toBe('pr');
+      expect(comments[0]?.body).toContain('PR: TeamFloPay/sdk#655');
+      expect(comments[0]?.body).toContain('## v1.0.1 - Ready SDK PR');
+      expect(comments[0]?.body).toContain('Ready SDK PR updates the SDK behavior.');
+      expect(comments[0]?.body).toContain('[Read the full changelog](https://changelog.sdk.flopay.com)');
+      expect(comments[0]?.body).not.toContain('Outcome:');
+      expect(comments[0]?.body).not.toContain('Checks:');
     } finally {
       process.env.PATH = originalPath;
       for (const key of envKeys) {
@@ -5447,19 +5530,26 @@ function seedMergedMainForChangelogFixture(sdkRemote: string, releaseBump: boole
 function writeChangelogMergeGhFixture(
   bin: string,
   sdkRemote: string,
-  options: { releaseBump?: boolean; dependabotFailure?: boolean; merged?: boolean; mergeabilityFlapPath?: string } = {}
+  options: {
+    releaseBump?: boolean;
+    dependabotFailure?: boolean;
+    merged?: boolean;
+    mergeabilityFlapPath?: string;
+    commentLogPath?: string;
+  } = {}
 ) {
   const ghPath = path.join(bin, 'gh');
   const releaseBump = options.releaseBump !== false;
   const dependabotFailure = options.dependabotFailure === true;
   const merged = options.merged === true;
   const mergeabilityFlapPath = options.mergeabilityFlapPath ?? '';
+  const commentLogPath = options.commentLogPath ?? '';
   if (merged) seedMergedMainForChangelogFixture(sdkRemote, releaseBump);
   writeFileSync(
     ghPath,
     `#!/usr/bin/env node
 const args = process.argv.slice(2);
-const { mkdtempSync, readFileSync, writeFileSync } = require('node:fs');
+const { appendFileSync, mkdtempSync, readFileSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -5468,6 +5558,7 @@ const releaseBump = ${JSON.stringify(releaseBump)};
 const dependabotFailure = ${JSON.stringify(dependabotFailure)};
 const merged = ${JSON.stringify(merged)};
 const mergeabilityFlapPath = ${JSON.stringify(mergeabilityFlapPath)};
+const commentLogPath = ${JSON.stringify(commentLogPath)};
 
 function json(value) {
   process.stdout.write(JSON.stringify(value));
@@ -5476,6 +5567,14 @@ function json(value) {
 function optionValue(name) {
   const index = args.indexOf(name);
   return index === -1 ? undefined : args[index + 1];
+}
+
+function recordComment(kind, repo, number, body, url) {
+  if (commentLogPath) {
+    appendFileSync(commentLogPath, JSON.stringify({ kind, repo, number, body, url }) + '\\n');
+  }
+  process.stdout.write(url);
+  process.exit(0);
 }
 
 function remoteMainSha() {
@@ -5605,6 +5704,20 @@ if (args[0] === 'pr' && args[1] === 'merge') {
     process.exit(result.status || 1);
   }
   process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'comment') {
+  const number = args[2];
+  const repo = optionValue('--repo') || 'TeamFloPay/sdk';
+  const body = optionValue('--body') || '';
+  recordComment('pr', repo, number, body, 'https://github.com/' + repo + '/pull/' + number + '#issuecomment-1');
+}
+
+if (args[0] === 'issue' && args[1] === 'comment') {
+  const number = args[2];
+  const repo = optionValue('--repo') || 'TeamFloPay/sdk';
+  const body = optionValue('--body') || '';
+  recordComment('issue', repo, number, body, 'https://github.com/' + repo + '/issues/' + number + '#issuecomment-2');
 }
 
 console.error('Unexpected gh fixture call: ' + args.join(' '));

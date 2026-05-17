@@ -789,6 +789,7 @@ async function promptPrMergeFollowUps(
     pr: string;
     issue?: string;
     summary?: string;
+    summaryBody?: string;
     confirmSummary?: boolean;
     confirmCleanup?: boolean;
   }
@@ -800,6 +801,7 @@ async function promptPrMergeFollowUps(
         pr: options.pr,
         issue: options.issue,
         summary: options.summary,
+        summaryBody: options.summaryBody,
         postSummary: true,
         confirmSummary: true,
       });
@@ -2193,6 +2195,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         pr: resolvedPr,
         issue: confirmedResult.issue ?? resolvedIssue,
         summary: opts.summary,
+        summaryBody: confirmedResult.summary,
         confirmSummary: opts.confirmSummary,
         confirmCleanup: opts.confirmCleanup,
       });
