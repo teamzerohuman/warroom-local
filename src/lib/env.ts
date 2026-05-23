@@ -444,9 +444,20 @@ function runForegroundAdapterProcess(
   const stdoutPath = path.join(outputDir, 'stdout.log');
   const stderrPath = path.join(outputDir, 'stderr.log');
   const command = [shellQuote(resolvedCommand), ...invocation.args.map(shellQuote)].join(' ');
+  // Claude's stream-json mode (and the required --verbose flag) floods the terminal with
+  // event JSON on stdout and debug logs on stderr. Capture both to files and emit a single
+  // "#" per output line so the user can see liveness without the noise.
+  const useDotProgress = invocation.adapter === 'claude';
+  const dotAwk = `awk '{ printf "#" > "/dev/stderr"; fflush("/dev/stderr") }'`;
+  const stdoutSink = useDotProgress
+    ? `tee ${shellQuote(stdoutPath)} | ${dotAwk} > /dev/null; printf "\\n" >&2`
+    : `tee ${shellQuote(stdoutPath)}`;
+  const stderrSink = useDotProgress
+    ? `tee ${shellQuote(stderrPath)} | ${dotAwk} > /dev/null`
+    : `tee ${shellQuote(stderrPath)} >&2`;
   const script = [
     'set -o pipefail',
-    `${command} 2> >(tee ${shellQuote(stderrPath)} >&2) | tee ${shellQuote(stdoutPath)}`,
+    `{ ${command} 2> >(${stderrSink}); } | { ${stdoutSink}; }`,
     'exit ${PIPESTATUS[0]}',
   ].join('\n');
   try {
@@ -457,12 +468,18 @@ function runForegroundAdapterProcess(
       encoding: 'utf8',
       env: options.env,
     });
+    const stdoutText = existsSync(stdoutPath) ? readFileSync(stdoutPath, 'utf8') : '';
+    const stderrText = existsSync(stderrPath) ? readFileSync(stderrPath, 'utf8') : '';
+    if (useDotProgress && result.status !== 0 && stderrText) {
+      // Adapter failed: surface the captured stderr the user wasn't shown during the run.
+      process.stderr.write(stderrText.endsWith('\n') ? stderrText : `${stderrText}\n`);
+    }
     return {
       status: result.status,
       signal: result.signal,
       error: result.error,
-      stdout: existsSync(stdoutPath) ? readFileSync(stdoutPath, 'utf8') : '',
-      stderr: existsSync(stderrPath) ? readFileSync(stderrPath, 'utf8') : '',
+      stdout: stdoutText,
+      stderr: stderrText,
     };
   } finally {
     rmSync(outputDir, { recursive: true, force: true });

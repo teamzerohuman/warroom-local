@@ -57,6 +57,8 @@ import {
   saveChangelogDraft,
   clearChangelogDraft,
   resumeChangelogShare,
+  captureInteractiveEditNotes,
+  recordChangelogShareSent,
   PERIOD_LABEL,
   type ChangelogPeriod,
   type ChangelogShareResult,
@@ -67,6 +69,7 @@ import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
 import { readWorkspaceEnvVar } from './lib/env.js';
 import { formatLlmUsageSummary, refreshIssueUsageLedgerCosts, summarizeIssueUsage, type LlmUsageSummary } from './lib/llm-usage.js';
 import { pickCommandPath } from './lib/interactive-menu.js';
+import { selectChoice } from './lib/prompt.js';
 import { runGit } from './lib/repos.js';
 import { findWarRoomWorkspace } from './lib/workspace.js';
 
@@ -231,19 +234,17 @@ async function promptPrReviewSelection(output: Output, input: Input, prs: PrRevi
 }
 
 async function promptConfirmation(output: Output, input: Input, question: string) {
-  output(question);
-
-  const readline = createInterface({ input, crlfDelay: Infinity });
-  try {
-    for await (const line of readline) {
-      const answer = line.trim().toLowerCase();
-      return answer === '' || answer === 'y' || answer === 'yes';
-    }
-  } finally {
-    readline.close();
-  }
-
-  return true;
+  return selectChoice<boolean>({
+    output,
+    input,
+    question,
+    default: true,
+    choices: [
+      { label: 'Yes', value: true, aliases: ['y'] },
+      { label: 'No', value: false, aliases: ['n'] },
+    ],
+    retryHelp: 'Enter yes or no.',
+  });
 }
 
 async function promptText(output: Output, input: Input, question: string): Promise<string> {
@@ -262,41 +263,33 @@ async function promptText(output: Output, input: Input, question: string): Promi
 }
 
 async function promptMergeConfirmation(output: Output, input: Input, question: string): Promise<'confirm' | 'skip' | 'cancel'> {
-  output(question);
-
-  const readline = createInterface({ input, crlfDelay: Infinity });
-  try {
-    for await (const line of readline) {
-      const answer = line.trim().toLowerCase();
-      if (!answer || answer === 'y' || answer === 'yes') return 'confirm';
-      if (answer === 's' || answer === 'skip') return 'skip';
-      if (answer === 'n' || answer === 'no') return 'cancel';
-      output('Enter y to run the gate, skip to merge without Playwright, or n to cancel.');
-    }
-  } finally {
-    readline.close();
-  }
-
-  return 'confirm';
+  return selectChoice<'confirm' | 'skip' | 'cancel'>({
+    output,
+    input,
+    question,
+    default: 'confirm',
+    choices: [
+      { label: 'Yes', value: 'confirm', aliases: ['y'] },
+      { label: 'No', value: 'cancel', aliases: ['n'] },
+      { label: 'Skip', value: 'skip', aliases: ['s'] },
+    ],
+    retryHelp: 'Enter yes to run the gate, skip to merge without Playwright, or no to cancel.',
+  });
 }
 
 async function promptBlockedMergeConfirmation(output: Output, input: Input, question: string): Promise<'confirm' | 'skip' | 'cancel'> {
-  output(question);
-
-  const readline = createInterface({ input, crlfDelay: Infinity });
-  try {
-    for await (const line of readline) {
-      const answer = line.trim().toLowerCase();
-      if (!answer || answer === 'y' || answer === 'yes') return 'confirm';
-      if (answer === 's' || answer === 'skip') return 'skip';
-      if (answer === 'n' || answer === 'no') return 'cancel';
-      output('Enter y to recheck blockers, skip to allow unresolved review threads, or n to cancel.');
-    }
-  } finally {
-    readline.close();
-  }
-
-  return 'confirm';
+  return selectChoice<'confirm' | 'skip' | 'cancel'>({
+    output,
+    input,
+    question,
+    default: 'confirm',
+    choices: [
+      { label: 'Yes', value: 'confirm', aliases: ['y'] },
+      { label: 'No', value: 'cancel', aliases: ['n'] },
+      { label: 'Skip', value: 'skip', aliases: ['s'] },
+    ],
+    retryHelp: 'Enter yes to recheck blockers, skip to bypass failing checks and unresolved threads (gh pr merge --admin), or no to cancel.',
+  });
 }
 
 async function promptMergeChangelogConfirmation(output: Output, input: Input, plan: MergeChangelogResult) {
@@ -321,21 +314,19 @@ function parseVersionBumpChoice(value: string | undefined): VersionBumpChoice | 
 }
 
 async function promptMergeBumpChoice(output: Output, input: Input, _plan: MergeBumpResult): Promise<VersionBumpChoice> {
-  output('Should we bump the version number? [PATCH|minor|major|skip]');
-
-  const readline = createInterface({ input, crlfDelay: Infinity });
-  try {
-    for await (const line of readline) {
-      const answer = line.trim().toLowerCase();
-      if (!answer) return 'patch';
-      if (answer === 'patch' || answer === 'minor' || answer === 'major' || answer === 'skip') return answer;
-      output('Enter patch, minor, major, skip, or press Enter for patch.');
-    }
-  } finally {
-    readline.close();
-  }
-
-  return 'skip';
+  return selectChoice<VersionBumpChoice>({
+    output,
+    input,
+    question: 'Should we bump the version number? [PATCH|minor|major|skip]',
+    default: 'patch',
+    choices: [
+      { label: 'Patch', value: 'patch' },
+      { label: 'Minor', value: 'minor' },
+      { label: 'Major', value: 'major' },
+      { label: 'Skip', value: 'skip' },
+    ],
+    retryHelp: 'Enter patch, minor, major, skip, or press Enter for patch.',
+  });
 }
 
 function createE2EOutput(output: Output, customOutput: boolean): E2EOutput {
@@ -833,8 +824,23 @@ async function promptPrMergeFollowUps(
         summaryBody: options.summaryBody,
         postSummary: true,
         confirmSummary: true,
+        confirmStatus: true,
       });
       printSummaryPosts(output, summaryResult.summaryPosts);
+      if (summaryResult.campaignStatus) {
+        output(
+          `Campaign status: ${summaryResult.campaignStatus.applied ? 'updated' : 'planned'} ${summaryResult.campaignStatus.issue} -> ${summaryResult.campaignStatus.status}`
+        );
+      }
+      if (summaryResult.labelUpdate) {
+        const removed = summaryResult.labelUpdate.removeLabels.length
+          ? `; removed ${summaryResult.labelUpdate.removeLabels.join(', ')}`
+          : '';
+        output(
+          `Issue labels: ${summaryResult.labelUpdate.applied ? 'updated' : 'planned'} ${summaryResult.labelUpdate.issue} +${summaryResult.labelUpdate.addLabel}${removed}`
+        );
+        if (summaryResult.labelUpdate.error) output(`label update error: ${summaryResult.labelUpdate.error}`);
+      }
     }
   }
 
@@ -906,15 +912,26 @@ async function runInteractivePrMergeFlow(
     const blocked = (confirmedResult.mergeReadiness?.blocked.length ?? 0) > 0;
     const e2eRequired = confirmedResult.mergeE2E?.required ?? true;
     let allowUnresolvedReviewThreads = false;
+    let allowFailingChecks = false;
     let skipMergeE2E = false;
     let mergeChoice: 'confirm' | 'skip' | 'cancel';
     if (blocked) {
       mergeChoice = await promptBlockedMergeConfirmation(
         output,
         input,
-        'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [Y/n/skip]'
+        'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to bypass failing checks and unresolved review threads (uses gh pr merge --admin). [Y/n/skip]'
       );
       allowUnresolvedReviewThreads = mergeChoice === 'skip';
+      allowFailingChecks = mergeChoice === 'skip';
+      if (mergeChoice === 'skip' && e2eRequired) {
+        const e2eChoice = await promptMergeConfirmation(
+          output,
+          input,
+          'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [Y/n/skip]'
+        );
+        skipMergeE2E = e2eChoice === 'skip';
+        if (e2eChoice === 'cancel') mergeChoice = 'cancel';
+      }
     } else if (e2eRequired) {
       mergeChoice = await promptMergeConfirmation(
         output,
@@ -928,18 +945,22 @@ async function runInteractivePrMergeFlow(
     }
 
     if (mergeChoice !== 'cancel') {
+      const bypassing = allowFailingChecks || allowUnresolvedReviewThreads;
       output(
-        allowUnresolvedReviewThreads
-          ? 'Running confirmed PR merge while allowing unresolved review threads...'
-          : skipMergeE2E
-            ? 'Running confirmed PR merge without demo Playwright e2e...'
-            : 'Running confirmed PR merge...'
+        bypassing && skipMergeE2E
+          ? 'Running confirmed PR merge while bypassing preflight blockers (gh pr merge --admin) and without demo Playwright e2e...'
+          : bypassing
+            ? 'Running confirmed PR merge while bypassing preflight blockers (gh pr merge --admin)...'
+            : skipMergeE2E
+              ? 'Running confirmed PR merge without demo Playwright e2e...'
+              : 'Running confirmed PR merge...'
       );
       confirmedResult = await runPrMerge(workspaceRoot, {
         ...baseOptions,
         confirm: true,
         skipMergeE2E,
         allowUnresolvedReviewThreads,
+        allowFailingChecks,
       });
       printPrPlan(output, confirmedResult);
       if (mergeCloseoutFailed(confirmedResult)) process.exitCode = 1;
@@ -953,6 +974,7 @@ async function runInteractivePrMergeFlow(
     pr: options.pr,
     issue: confirmedResult.issue ?? options.issue,
     summary: options.summary,
+    summaryBody: confirmedResult.summary,
     confirmSummary: options.confirmSummary,
     confirmCleanup: options.confirmCleanup,
   });
@@ -2103,6 +2125,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--cleanup-local', 'Plan or return the mapped local checkout to the PR base branch and pull it.')
     .option('--confirm-cleanup', 'Actually switch the mapped local checkout and pull when cleanup is safe. Implies --cleanup-local.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
+    .option('--allow-failing-checks', 'Bypass failing or incomplete status checks and unresolved review threads. Runs gh pr merge with --admin to override branch protection.')
     .option('--json', 'Print machine-readable output.')
     .action(async (opts: {
       pr?: string;
@@ -2119,6 +2142,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       cleanupLocal?: boolean;
       confirmCleanup?: boolean;
       writeArtifact?: boolean;
+      allowFailingChecks?: boolean;
       json?: boolean;
     }) => {
       const bumpVersion = parseVersionBumpChoice(opts.bumpVersion);
@@ -2160,6 +2184,8 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         cleanupLocal: opts.cleanupLocal || opts.confirmCleanup,
         confirmCleanup: opts.confirmCleanup,
         writeArtifact: opts.writeArtifact,
+        allowFailingChecks: opts.allowFailingChecks,
+        allowUnresolvedReviewThreads: opts.allowFailingChecks,
         ...liveE2EOutput,
       });
       if (opts.json) {
@@ -2174,15 +2200,26 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         const blocked = (result.mergeReadiness?.blocked.length ?? 0) > 0;
         const e2eRequired = result.mergeE2E?.required ?? true;
         let allowUnresolvedReviewThreads = false;
+        let allowFailingChecks = false;
         let skipMergeE2E = false;
         let mergeChoice: 'confirm' | 'skip' | 'cancel';
         if (blocked) {
           mergeChoice = await promptBlockedMergeConfirmation(
             output,
             input,
-            'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [Y/n/skip]'
+            'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to bypass failing checks and unresolved review threads (uses gh pr merge --admin). [Y/n/skip]'
           );
           allowUnresolvedReviewThreads = mergeChoice === 'skip';
+          allowFailingChecks = mergeChoice === 'skip';
+          if (mergeChoice === 'skip' && e2eRequired) {
+            const e2eChoice = await promptMergeConfirmation(
+              output,
+              input,
+              'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [Y/n/skip]'
+            );
+            skipMergeE2E = e2eChoice === 'skip';
+            if (e2eChoice === 'cancel') mergeChoice = 'cancel';
+          }
         } else if (e2eRequired) {
           mergeChoice = await promptMergeConfirmation(
             output,
@@ -2195,12 +2232,15 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           mergeChoice = confirmed ? 'confirm' : 'cancel';
         }
         if (mergeChoice !== 'cancel') {
+          const bypassing = allowFailingChecks || allowUnresolvedReviewThreads;
           output(
-            allowUnresolvedReviewThreads
-              ? 'Running confirmed PR merge while allowing unresolved review threads...'
-              : skipMergeE2E
-                ? 'Running confirmed PR merge without demo Playwright e2e...'
-                : 'Running confirmed PR merge...'
+            bypassing && skipMergeE2E
+              ? 'Running confirmed PR merge while bypassing preflight blockers (gh pr merge --admin) and without demo Playwright e2e...'
+              : bypassing
+                ? 'Running confirmed PR merge while bypassing preflight blockers (gh pr merge --admin)...'
+                : skipMergeE2E
+                  ? 'Running confirmed PR merge without demo Playwright e2e...'
+                  : 'Running confirmed PR merge...'
           );
           confirmedResult = await runPrMerge(workspaceRoot, {
             pr: resolvedPr,
@@ -2208,6 +2248,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             confirm: true,
             skipMergeE2E,
             allowUnresolvedReviewThreads,
+            allowFailingChecks,
             confirmStatus: opts.confirmStatus,
             confirmChangelog: opts.confirmChangelog,
             resumeChangelog: opts.resumeChangelog,
@@ -2385,19 +2426,28 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           process.exitCode = 1;
           return;
         } else if (interactive) {
-          const answer = await new Promise<string>((resolve) => {
-            output('Select reporting period (day/week/month) [week]: ');
-            const rl = createInterface({ input });
-            rl.once('line', (line) => { rl.close(); resolve(line.trim().toLowerCase()); });
-            rl.once('close', () => resolve(''));
+          period = await selectChoice<ChangelogPeriod>({
+            output,
+            input,
+            question: 'Select reporting period (day/week/month) [week]:',
+            default: 'week',
+            choices: [
+              { label: 'Week', value: 'week' },
+              { label: 'Day', value: 'day' },
+              { label: 'Month', value: 'month' },
+            ],
+            retryHelp: 'Enter day, week, or month, or press Enter for week.',
           });
-          period = (validPeriods as string[]).includes(answer) ? (answer as ChangelogPeriod) : 'week';
         } else {
           period = 'week';
         }
 
         output(`Loading ${PERIOD_LABEL[period].toLowerCase()} changelog entries...`);
         result = runChangelogShare(workspaceRoot, period);
+        const cutoffLabel = result.cutoffSource === 'last-sent'
+          ? `Cutoff: since last send at ${result.cutoff.toISOString()}.`
+          : `Cutoff: rolling ${PERIOD_LABEL[period].toLowerCase().replace(' update', '')} window starting ${result.cutoff.toISOString()} (no prior send recorded).`;
+        output(cutoffLabel);
       }
 
       if (result.error) {
@@ -2417,7 +2467,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
 
       if (result.content && !savedDraft) {
-        saveChangelogDraft(workspaceRoot, result.period, result.periodLabel, result.entries, result.content);
+        saveChangelogDraft(workspaceRoot, result.period, result.periodLabel, result.entries, result.content, {
+          cutoff: result.cutoff,
+          cutoffSource: result.cutoffSource,
+        });
       }
 
       const slackToken = readWorkspaceEnvVar(workspaceRoot, 'SLACK_BOT_TOKEN') ?? process.env.SLACK_BOT_TOKEN ?? '';
@@ -2448,7 +2501,6 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
 
-      // Feedback loop — keep revising until the user is happy or declines edits
       let currentResult: ChangelogShareResult = result;
       let currentBlocks = result.blocks!;
       let currentFallbackText = result.fallbackText!;
@@ -2457,15 +2509,22 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         const wantsEdits = await promptConfirmation(output, input, 'Draft sent to Slack. Would you like to make edits? [Y/n]');
         if (!wantsEdits) break;
 
-        const feedbackText = await promptText(output, input, 'Describe the changes you\'d like (e.g. "shorter intro", "more casual tone"):');
+        output('Launching interactive editor — talk through the changes with the assistant, then exit the session.');
+        const editSession = captureInteractiveEditNotes(workspaceRoot, currentResult);
 
-        if (!feedbackText) {
-          output('No feedback entered — moving on.');
+        if (editSession.adapterError && !editSession.launched) {
+          output(`Adapter error: ${editSession.adapterError}`);
+          output('Keeping previous draft.');
+          break;
+        }
+        if (editSession.notes === null) {
+          if (editSession.adapterError) output(editSession.adapterError);
+          output('No revision notes captured — keeping previous draft.');
           break;
         }
 
-        output('Regenerating with your feedback...');
-        const revision = reviseChangelogContent(workspaceRoot, currentResult, feedbackText);
+        output('Regenerating with notes from the editor session...');
+        const revision = reviseChangelogContent(workspaceRoot, currentResult, editSession.notes);
 
         if (revision.adapterError || !revision.blocks) {
           output(`Adapter error: ${revision.adapterError ?? 'no content returned'}`);
@@ -2473,13 +2532,20 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           break;
         }
 
-        // Merge revised content back so further revisions have the latest version
         currentResult = { ...currentResult, content: revision.content, blocks: revision.blocks, fallbackText: revision.fallbackText };
         currentBlocks = revision.blocks;
         currentFallbackText = revision.fallbackText!;
 
         if (revision.content) {
-          saveChangelogDraft(workspaceRoot, currentResult.period, currentResult.periodLabel, currentResult.entries, revision.content, loadChangelogDraft(workspaceRoot));
+          saveChangelogDraft(
+            workspaceRoot,
+            currentResult.period,
+            currentResult.periodLabel,
+            currentResult.entries,
+            revision.content,
+            { cutoff: currentResult.cutoff, cutoffSource: currentResult.cutoffSource },
+            loadChangelogDraft(workspaceRoot)
+          );
         }
 
         output('Posting revised draft to #changelog-review...');
@@ -2520,6 +2586,11 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       }
 
       clearChangelogDraft(workspaceRoot);
+      if (successCount > 0) {
+        const sentAt = new Date();
+        recordChangelogShareSent(workspaceRoot, currentResult.period, sentAt);
+        output(`Recorded last-sent timestamp for ${PERIOD_LABEL[currentResult.period].toLowerCase()}: ${sentAt.toISOString()}.`);
+      }
 
       printOutcome(
         output,

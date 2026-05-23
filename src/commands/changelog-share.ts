@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import YAML from 'yaml';
 import { absolutePath, loadRepoManifest } from '../lib/repos.js';
 import { loadAlliesManifest } from '../lib/allies.js';
-import { runAdapter } from '../lib/env.js';
+import { runAdapter, runInteractiveAdapter } from '../lib/env.js';
 
 export type ChangelogPeriod = 'day' | 'week' | 'month';
 
@@ -40,6 +40,8 @@ export type ChangelogShareResult = {
   period: ChangelogPeriod;
   periodLabel: string;
   entries: ChangelogEntry[];
+  cutoff: Date;
+  cutoffSource: 'last-sent' | 'period-default';
   content: ChangelogShareContent | null;
   blocks: object[] | null;
   fallbackText: string | null;
@@ -60,6 +62,43 @@ function periodCutoff(period: ChangelogPeriod): Date {
   return new Date(Date.now() - PERIOD_DAYS[period] * 24 * 60 * 60 * 1000);
 }
 
+export type ChangelogShareState = {
+  lastSent?: Partial<Record<ChangelogPeriod, string>>;
+};
+
+function stateFilePath(workspaceRoot: string): string {
+  return path.join(workspaceRoot, '.warroom', 'changelog-share-state.json');
+}
+
+export function loadChangelogShareState(workspaceRoot: string): ChangelogShareState {
+  const file = stateFilePath(workspaceRoot);
+  if (!existsSync(file)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as ChangelogShareState;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function recordChangelogShareSent(workspaceRoot: string, period: ChangelogPeriod, when: Date = new Date()): void {
+  const dir = path.join(workspaceRoot, '.warroom');
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const current = loadChangelogShareState(workspaceRoot);
+  const lastSent = { ...(current.lastSent ?? {}), [period]: when.toISOString() };
+  writeFileSync(stateFilePath(workspaceRoot), JSON.stringify({ ...current, lastSent }, null, 2));
+}
+
+function resolveCutoff(workspaceRoot: string, period: ChangelogPeriod): { cutoff: Date; source: 'last-sent' | 'period-default' } {
+  const state = loadChangelogShareState(workspaceRoot);
+  const lastSentRaw = state.lastSent?.[period];
+  if (lastSentRaw) {
+    const parsed = new Date(lastSentRaw);
+    if (!isNaN(parsed.getTime())) return { cutoff: parsed, source: 'last-sent' };
+  }
+  return { cutoff: periodCutoff(period), source: 'period-default' };
+}
+
 function parseFrontmatter(raw: string): Record<string, unknown> {
   const match = raw.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return {};
@@ -74,8 +113,7 @@ function openChangelogEntryUrl(baseUrl: string, publishedAt: Date): string {
   return `${baseUrl}/release/${Math.floor(publishedAt.getTime() / 1000)}`;
 }
 
-function loadChangelogEntries(workspaceRoot: string, period: ChangelogPeriod): ChangelogEntry[] {
-  const cutoff = periodCutoff(period);
+function loadChangelogEntries(workspaceRoot: string, _period: ChangelogPeriod, cutoff: Date): ChangelogEntry[] {
   const manifest = loadRepoManifest(workspaceRoot);
   const entries: ChangelogEntry[] = [];
 
@@ -265,6 +303,76 @@ export function reviseChangelogContent(
   return { content, blocks, fallbackText, adapterError, adapterCommand };
 }
 
+export type InteractiveEditNotesResult = {
+  notes: string | null;
+  launched: boolean;
+  adapterError: string | null;
+};
+
+export function captureInteractiveEditNotes(
+  workspaceRoot: string,
+  result: ChangelogShareResult
+): InteractiveEditNotesResult {
+  const dir = path.join(workspaceRoot, '.warroom');
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const notesFilename = path.join('.warroom', 'changelog-share-edit-notes.txt');
+  const notesPath = path.join(workspaceRoot, notesFilename);
+  if (existsSync(notesPath)) {
+    try { unlinkSync(notesPath); } catch { /* ignore */ }
+  }
+
+  const current = result.content;
+  const entryList = result.entries
+    .map((e) => `- ${e.repoName}: "${e.title}" (${e.publishedAt.toDateString()})`)
+    .join('\n');
+
+  const prompt = [
+    'You are an interactive editor helping a teammate revise a Slack changelog message before it ships to ally channels.',
+    '',
+    `Reporting period: ${result.periodLabel}`,
+    '',
+    'Current Slack message draft:',
+    `- Title: ${current?.title ?? '(empty)'}`,
+    `- Intro: ${current?.intro ?? '(empty)'}`,
+    `- Signoff: ${current?.signoff ?? '(empty)'}`,
+    '',
+    'Underlying changelog entries the message describes:',
+    entryList,
+    '',
+    'How to run the session:',
+    '- Talk with the user. Ask short clarifying questions about what they want to change.',
+    '- Offer concrete suggestions for the title, intro, or signoff when useful.',
+    '- Iterate. Do not produce the final Slack copy yourself — your job is to capture clear revision notes.',
+    '- When the user signals they are done (e.g. "we are good", "looks right", "exit"), stop the discussion.',
+    '',
+    `Before you end the session, write the final consolidated revision notes to: ${notesFilename}`,
+    'The notes should:',
+    '- Be plain prose (not JSON), 1-6 sentences.',
+    '- Describe exactly which changes to make to the title, intro, and signoff.',
+    '- Reflect the user\'s final intent — not the back-and-forth dialogue.',
+    '',
+    'If the user changes their mind and wants no edits at all, write an empty file at that path so the caller can detect "no changes".',
+    'After writing the file, end the session.',
+  ].join('\n');
+
+  const launch = runInteractiveAdapter(workspaceRoot, prompt, { cwd: workspaceRoot });
+  if (!launch.launched) {
+    return { notes: null, launched: false, adapterError: launch.error ?? 'Interactive adapter failed to launch.' };
+  }
+
+  if (!existsSync(notesPath)) {
+    return {
+      notes: null,
+      launched: true,
+      adapterError: `Interactive editor ended without writing notes to ${notesFilename}.`,
+    };
+  }
+
+  const raw = readFileSync(notesPath, 'utf8').trim();
+  try { unlinkSync(notesPath); } catch { /* ignore */ }
+  return { notes: raw.length > 0 ? raw : null, launched: true, adapterError: null };
+}
+
 export function postToSlack(
   token: string,
   channel: string,
@@ -308,6 +416,8 @@ export type ChangelogDraft = {
   periodLabel: string;
   entries: Array<{ title: string; publishedAt: string; repoName: string; entryUrl: string }>;
   content: ChangelogShareContent;
+  cutoff?: string;
+  cutoffSource?: 'last-sent' | 'period-default';
   createdAt: string;
   updatedAt: string;
 };
@@ -334,6 +444,7 @@ export function saveChangelogDraft(
   periodLabel: string,
   entries: ChangelogEntry[],
   content: ChangelogShareContent,
+  meta: { cutoff: Date; cutoffSource: 'last-sent' | 'period-default' },
   existing?: ChangelogDraft | null
 ): void {
   const dir = path.join(workspaceRoot, '.warroom');
@@ -349,6 +460,8 @@ export function saveChangelogDraft(
       entryUrl: e.entryUrl,
     })),
     content,
+    cutoff: meta.cutoff.toISOString(),
+    cutoffSource: meta.cutoffSource,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };
@@ -375,10 +488,14 @@ export function resumeChangelogShare(workspaceRoot: string, draft: ChangelogDraf
   const alliesWithComms = loadAlliesWithComms(workspaceRoot);
   const blocks = buildSlackBlocks(draft.content, entries, draft.periodLabel);
   const fallbackText = `FloPay ChangeLog ${draft.periodLabel} — ${draft.content.title}`;
+  const cutoff = draft.cutoff ? new Date(draft.cutoff) : periodCutoff(draft.period);
+  const cutoffSource: 'last-sent' | 'period-default' = draft.cutoffSource ?? 'period-default';
   return {
     period: draft.period,
     periodLabel: draft.periodLabel,
     entries,
+    cutoff,
+    cutoffSource,
     content: draft.content,
     blocks,
     fallbackText,
@@ -391,19 +508,23 @@ export function resumeChangelogShare(workspaceRoot: string, draft: ChangelogDraf
 
 export function runChangelogShare(workspaceRoot: string, period: ChangelogPeriod): ChangelogShareResult {
   const periodLabel = PERIOD_LABEL[period];
-  const entries = loadChangelogEntries(workspaceRoot, period);
+  const { cutoff, source: cutoffSource } = resolveCutoff(workspaceRoot, period);
+  const entries = loadChangelogEntries(workspaceRoot, period, cutoff);
   const alliesWithComms = loadAlliesWithComms(workspaceRoot);
 
   if (entries.length === 0) {
+    const cutoffLabel = cutoffSource === 'last-sent' ? `since the last send (${cutoff.toISOString()})` : `in the last ${PERIOD_DAYS[period]} day${PERIOD_DAYS[period] === 1 ? '' : 's'}`;
     return {
       period,
       periodLabel,
       entries: [],
+      cutoff,
+      cutoffSource,
       content: null,
       blocks: null,
       fallbackText: null,
       alliesWithComms,
-      error: `No changelog entries found in the last ${PERIOD_DAYS[period]} day${PERIOD_DAYS[period] === 1 ? '' : 's'}.`,
+      error: `No changelog entries found ${cutoffLabel}.`,
       adapterError: null,
       adapterCommand: null,
     };
@@ -417,6 +538,8 @@ export function runChangelogShare(workspaceRoot: string, period: ChangelogPeriod
     period,
     periodLabel,
     entries,
+    cutoff,
+    cutoffSource,
     content,
     blocks,
     fallbackText,

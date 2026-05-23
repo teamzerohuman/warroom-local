@@ -68,6 +68,7 @@ export type PrOptions = {
   issueComment?: boolean;
   checkInMinutes?: number;
   allowUnresolvedReviewThreads?: boolean;
+  allowFailingChecks?: boolean;
   issueTitle?: string;
   issueUrl?: string;
   prText?: PrTextResult;
@@ -2230,7 +2231,7 @@ function buildMergeReadiness(pr: {
     detailsUrl?: string;
     targetUrl?: string;
   }>;
-}, unresolvedReviewThreads: MergeReadiness['unresolvedReviewThreads'] = [], options: { allowUnresolvedReviewThreads?: boolean } = {}): MergeReadiness {
+}, unresolvedReviewThreads: MergeReadiness['unresolvedReviewThreads'] = [], options: { allowUnresolvedReviewThreads?: boolean; allowFailingChecks?: boolean } = {}): MergeReadiness {
   const checks = (pr.statusCheckRollup ?? [])
     .filter((check) => check.name || check.context || check.status || check.conclusion || check.state || check.workflowName)
     .map((check) => ({
@@ -2278,19 +2279,25 @@ function buildMergeReadiness(pr: {
       'Mark the PR ready for review in GitHub, then rerun `warroom pr merge`.'
     );
   }
-  const mergeStateBlockedOnlyByAllowedThreads =
-    options.allowUnresolvedReviewThreads === true &&
+  const threadsAreAllowedOrEmpty =
+    options.allowUnresolvedReviewThreads === true || currentUnresolvedThreads.length === 0;
+  const checksAreAllowedOrEmpty =
+    options.allowFailingChecks === true || (failedChecks.length === 0 && incompleteChecks.length === 0);
+  const hasAnyAllowedBlocker =
+    (options.allowUnresolvedReviewThreads === true && currentUnresolvedThreads.length > 0) ||
+    (options.allowFailingChecks === true && (failedChecks.length > 0 || incompleteChecks.length > 0));
+  const mergeStateBlockedOnlyByAllowedConditions =
     mergeStateStatus === 'BLOCKED' &&
-    currentUnresolvedThreads.length > 0 &&
     requestedReviewers.length === 0 &&
     !['CHANGES_REQUESTED', 'REVIEW_REQUIRED'].includes((reviewDecision ?? '').toUpperCase()) &&
-    failedChecks.length === 0 &&
-    incompleteChecks.length === 0;
+    hasAnyAllowedBlocker &&
+    threadsAreAllowedOrEmpty &&
+    checksAreAllowedOrEmpty;
 
   if (
     mergeStateStatus &&
     ['BLOCKED', 'BEHIND', 'DIRTY', 'DRAFT', 'UNKNOWN'].includes(mergeStateStatus) &&
-    !mergeStateBlockedOnlyByAllowedThreads
+    !mergeStateBlockedOnlyByAllowedConditions
   ) {
     const evidence: string[] = [];
     if (mergeable) evidence.push(`GitHub mergeable value: ${mergeable}.`);
@@ -2359,20 +2366,22 @@ function buildMergeReadiness(pr: {
     );
   }
 
-  for (const check of checks) {
-    const state = check.state.toUpperCase();
-    if (['ACTION_REQUIRED', 'CANCELLED', 'ERROR', 'FAILURE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) {
-      addBlocker(
-        `Check failed: ${check.name} (${check.state}).`,
-        'GitHub returned a failing status for this check.',
-        `Open the check${check.url ? ` at ${check.url}` : ''}, fix the failure, push the fix, and wait for the check to pass.`
-      );
-    } else if (!['COMPLETED', 'SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(state)) {
-      addBlocker(
-        `Check is not complete: ${check.name} (${check.state}).`,
-        'GitHub has not reported this check as complete yet.',
-        `Wait for the check to finish${check.url ? ` or inspect it at ${check.url}` : ''}, then rerun \`warroom pr merge\`.`
-      );
+  if (!options.allowFailingChecks) {
+    for (const check of checks) {
+      const state = check.state.toUpperCase();
+      if (['ACTION_REQUIRED', 'CANCELLED', 'ERROR', 'FAILURE', 'STARTUP_FAILURE', 'TIMED_OUT'].includes(state)) {
+        addBlocker(
+          `Check failed: ${check.name} (${check.state}).`,
+          'GitHub returned a failing status for this check.',
+          `Open the check${check.url ? ` at ${check.url}` : ''}, fix the failure, push the fix, and wait for the check to pass.`
+        );
+      } else if (!['COMPLETED', 'SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(state)) {
+        addBlocker(
+          `Check is not complete: ${check.name} (${check.state}).`,
+          'GitHub has not reported this check as complete yet.',
+          `Wait for the check to finish${check.url ? ` or inspect it at ${check.url}` : ''}, then rerun \`warroom pr merge\`.`
+        );
+      }
     }
   }
 
@@ -4184,7 +4193,14 @@ async function waitForPrMergeable(
     lastState = readPrMergeability(ref);
     const { mergeable, mergeStateStatus } = lastState;
 
-    if (mergeable === 'MERGEABLE' && (mergeStateStatus === 'CLEAN' || mergeStateStatus === 'UNSTABLE' || mergeStateStatus === 'HAS_HOOKS')) {
+    const bypassBlocked = options.allowFailingChecks === true || options.allowUnresolvedReviewThreads === true;
+    if (
+      mergeable === 'MERGEABLE' &&
+      (mergeStateStatus === 'CLEAN' ||
+        mergeStateStatus === 'UNSTABLE' ||
+        mergeStateStatus === 'HAS_HOOKS' ||
+        (bypassBlocked && mergeStateStatus === 'BLOCKED'))
+    ) {
       options.mergeStatus?.(`${context}: PR is mergeable (mergeStateStatus=${mergeStateStatus}).`);
       return lastState;
     }
@@ -5690,6 +5706,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
   const reviewThreads = listPullRequestReviewThreads(ref);
   let readiness = buildMergeReadiness(pr, reviewThreads, {
     allowUnresolvedReviewThreads: options.allowUnresolvedReviewThreads,
+    allowFailingChecks: options.allowFailingChecks,
   });
   if (pr.state === 'MERGED') {
     readiness = { ...readiness, blocked: [], details: [] };
@@ -5740,7 +5757,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     options.allowUnresolvedReviewThreads
       ? '- Unresolved review threads were explicitly allowed for this merge attempt.'
       : '- Confirm all review and CodeRabbit feedback loops are resolved.',
-    '- Confirm validation status and target branch.',
+    options.allowFailingChecks
+      ? '- Failing or incomplete status checks were explicitly allowed for this merge attempt; gh pr merge will run with --admin to bypass branch protection.'
+      : '- Confirm validation status and target branch.',
     mergeE2E.required
       ? `- Run full demo Playwright e2e: start backend with \`${mergeE2E.backendCommand}\`, wait for ${mergeE2E.backendReadyUrl}, then run \`${mergeE2E.demoCommand}\` from the demo repo.`
       : `- Demo Playwright e2e skipped: ${mergeE2E.skipReason ?? 'merge.playwright is not enabled for this repo.'}`,
@@ -5846,9 +5865,11 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
         if (mergeBump.required && mergeBump.committed && mergeBump.pushed) {
           await waitForPrMergeable(ref, resolvedOptions, 'Version bump');
         }
+        const adminArgs =
+          options.allowFailingChecks || options.allowUnresolvedReviewThreads ? ['--admin'] : [];
         const result = spawnSync(
           'gh',
-          ['pr', 'merge', String(ref.number), '--repo', ref.repo, '--squash', '--delete-branch'],
+          ['pr', 'merge', String(ref.number), '--repo', ref.repo, '--squash', '--delete-branch', ...adminArgs],
           { stdio: 'inherit' }
         );
         if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);

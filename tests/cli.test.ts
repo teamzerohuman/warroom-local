@@ -3365,9 +3365,9 @@ exit 0
 
       expect(lines).toContain('PR merge: preflight only');
       expect(lines).toContain(
-        'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [Y/n/skip]'
+        'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to bypass failing checks and unresolved review threads (uses gh pr merge --admin). [Y/n/skip]'
       );
-      expect(lines).toContain('Running confirmed PR merge while allowing unresolved review threads...');
+      expect(lines).toContain('Running confirmed PR merge while bypassing preflight blockers (gh pr merge --admin)...');
       expect(lines).toContain('Merge readiness: clear');
       expect(lines).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/infra.)');
       expect(lines).toContain('Merged: yes');
