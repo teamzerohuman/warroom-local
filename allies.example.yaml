@@ -1,0 +1,30 @@
+# War Room ally manifest — TEMPLATE.
+#
+# Copy this file to `allies.yaml` (or run `warroom setup`) if your War Room
+# coordinates work with external/enterprise partners ("allies"). `allies.yaml`
+# is gitignored so partner-specific config never travels upstream.
+#
+# If you have no allies, an empty list is valid:
+#   version: 1
+#   allies: []
+version: 1
+allies:
+  - id: acme
+    name: Acme Corp
+    status: active # or planned
+    local_path: allies/acme
+    issue_repo:
+      github: your-org/ally-acme
+      local_path: allies/acme/repos/ally-acme
+      sync: unito
+      client_system: jira
+    env:
+      example: allies/acme/.env.local.example
+      local: allies/acme/.env.local
+    docs:
+      - allies/acme/README.md
+      - allies/acme/docs/operating-brief.md
+    comms:
+      - type: slack
+        channels:
+          - ally-acme-hub

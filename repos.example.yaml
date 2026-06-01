@@ -1,0 +1,94 @@
+# War Room repo manifest — TEMPLATE.
+#
+# Copy this file to `repos.yaml` (or run `warroom setup`) and replace the
+# placeholders with your own org and repos. `repos.yaml` is gitignored so your
+# project-specific manifest never travels upstream to the shared War Room.
+#
+# `warroom bootstrap` clones every active repo below into `local_root`.
+version: 1
+defaults:
+  owner: your-org
+  clone_protocol: ssh
+  default_branch: main
+  local_root: maps/repos
+repos:
+  # A minimal active repo. The only required merge automation is whatever your
+  # repo actually uses — delete the blocks you do not need.
+  - id: app
+    name: App
+    github: your-org/app
+    ssh_url: git@github.com:your-org/app.git
+    local_path: maps/repos/app
+    status: active
+    merge:
+      playwright: false
+      bump: false
+      changelog: false
+    owner: app
+    description: Primary application repository.
+    specialist:
+      name: App Sergeant
+      context:
+        frameworks:
+          - TypeScript
+        domains:
+          - application code
+        resources:
+          - github-cli
+          - typescript-docs
+
+  # A fuller example showing every merge-automation option.
+  - id: sdk
+    name: SDK
+    github: your-org/sdk
+    ssh_url: git@github.com:your-org/sdk.git
+    local_path: maps/repos/sdk
+    status: active
+    merge:
+      playwright: true
+      bump:
+        enabled: true
+        command: pnpm bump:version
+      post_merge: npm run build
+      changelog:
+        enabled: true
+        format: openchangelog # or keep-a-changelog
+        path: release-notes
+        url: https://changelog.example.com
+    owner: sdk
+    description: SDK packages published to a registry.
+    specialist:
+      name: SDK Sergeant
+      context:
+        frameworks:
+          - TypeScript
+          - pnpm
+        domains:
+          - package publishing
+        resources:
+          - github-cli
+          - npm-docs
+          - typescript-docs
+
+  # A planned repo is mapped but skipped by bootstrap until promoted to active.
+  - id: infra
+    name: infra
+    github: your-org/infra
+    ssh_url: git@github.com:your-org/infra.git
+    local_path: maps/repos/infra
+    status: planned
+    merge:
+      playwright: false
+      bump: false
+      changelog: false
+    owner: infra
+    description: Infrastructure and operational configuration.
+    specialist:
+      name: Infra Sergeant
+      context:
+        frameworks:
+          - Terraform
+        domains:
+          - infrastructure safety
+        resources:
+          - github-cli

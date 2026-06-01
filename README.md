@@ -21,6 +21,17 @@ From the War Room repo:
 npm install
 npm run build
 npm test
+```
+
+First-time setup — generate your project-specific config from the shipped
+templates. War Room tracks only `*.example` files; `repos.yaml`, `allies.yaml`,
+`.env.local`, and the `maps/*.md` files are gitignored so they never travel
+upstream to a shared/parent War Room:
+
+```sh
+npm run warroom -- setup        # interactive: build repos.yaml, allies, atlas
+# or non-interactive, copying every template verbatim:
+npm run warroom -- setup --yes --atlas
 npm run warroom -- doctor
 ```
 

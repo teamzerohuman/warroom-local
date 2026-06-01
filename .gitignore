@@ -11,6 +11,14 @@ coverage/
 *.key
 *.crt
 
+# Project-specific War Room config. The shared War Room (parent) ships only the
+# `*.example` templates; each consuming project generates these via `warroom
+# setup` so its repos/allies/maps never travel upstream. Keep the templates.
+repos.yaml
+allies.yaml
+maps/campaign-atlas.md
+maps/issue-territory.md
+
 # Local command artifacts.
 .warroom/runs/*
 !.warroom/runs/.gitkeep
