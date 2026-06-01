@@ -11,9 +11,17 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import { loadRepoManifest, type RepoEntry } from '../lib/repos.js';
+import { getProjectConfig, loadRepoManifest, type RepoEntry } from '../lib/repos.js';
 
-const FLOPAY_PACKAGES = ['shared', 'js', 'react', 'node'] as const;
+// SDK-to-demo linking is opt-in: the npm scope and workspace package list come
+// from repos.yaml `defaults` (npm_scope / dev_link_packages). Returns null when
+// the project has not configured it, so `dev` commands degrade gracefully.
+function getDevLinkConfig(workspaceRoot: string): { scope: string; packages: string[] } | null {
+  const config = getProjectConfig(workspaceRoot);
+  if (!config.npmScope || config.devLinkPackages.length === 0) return null;
+  return { scope: config.npmScope, packages: config.devLinkPackages };
+}
+
 const STATE_FILE = path.join('.warroom', 'dev', 'sdk-demo-link.json');
 const MIRROR_DIR = path.join('.warroom', 'dev', 'sdk-packages');
 
@@ -213,9 +221,10 @@ function getPackageLinkStatus(
   workspaceRoot: string,
   demoPath: string,
   sdkPath: string,
+  scope: string,
   packageName: string
 ): PackageLinkStatus {
-  const linkPath = path.join(demoPath, 'node_modules', '@flopay', packageName);
+  const linkPath = path.join(demoPath, 'node_modules', scope, packageName);
   const sdkPackagePath = path.join(sdkPath, 'packages', packageName);
   const targetPath = getPackageMirrorPath(workspaceRoot, packageName);
   const mirrorPackageJsonExists = existsSync(path.join(targetPath, 'package.json'));
@@ -229,7 +238,7 @@ function getPackageLinkStatus(
 
   if (!pathEntryExists(linkPath)) {
     return {
-      name: `@flopay/${packageName}`,
+      name: `${scope}/${packageName}`,
       linkPath,
       targetPath,
       sdkPackagePath,
@@ -253,7 +262,7 @@ function getPackageLinkStatus(
   const pointsAtMirror = isSymlink && samePath(actualTarget, targetPath);
 
   return {
-    name: `@flopay/${packageName}`,
+    name: `${scope}/${packageName}`,
     linkPath,
     targetPath,
     sdkPackagePath,
@@ -288,6 +297,19 @@ function getRequiredRepo(workspaceRoot: string, id: string) {
   return repo;
 }
 
+// The SDK-to-demo dev link is optional: it needs npm_scope/dev_link_packages
+// configured and both the `sdk` and `demo` repos mapped. Projects without it
+// (the generic default) should not see dev-link errors.
+export function isDevLinkAvailable(workspaceRoot: string): boolean {
+  try {
+    if (!getDevLinkConfig(workspaceRoot)) return false;
+    const manifest = loadRepoManifest(workspaceRoot);
+    return ['sdk', 'demo'].every((id) => manifest.repos.some((entry) => entry.id === id));
+  } catch {
+    return false;
+  }
+}
+
 function getStateFilePath(workspaceRoot: string) {
   return path.join(workspaceRoot, STATE_FILE);
 }
@@ -305,8 +327,9 @@ function getRecommendedCommands(sdkPath: string, demoPath: string) {
 export function runDevStatus(workspaceRoot: string): DevStatus {
   const sdk = getRepoDevStatus(workspaceRoot, getRequiredRepo(workspaceRoot, 'sdk'));
   const demo = getRepoDevStatus(workspaceRoot, getRequiredRepo(workspaceRoot, 'demo'));
-  const packages = FLOPAY_PACKAGES.map((packageName) =>
-    getPackageLinkStatus(workspaceRoot, demo.resolvedPath, sdk.resolvedPath, packageName)
+  const devLink = getDevLinkConfig(workspaceRoot);
+  const packages = (devLink?.packages ?? []).map((packageName) =>
+    getPackageLinkStatus(workspaceRoot, demo.resolvedPath, sdk.resolvedPath, devLink!.scope, packageName)
   );
   const linkedCount = packages.filter((pkg) => pkg.linked).length;
   const staleMirrorCount = packages.filter((pkg) => pkg.staleMirror).length;
@@ -323,7 +346,7 @@ export function runDevStatus(workspaceRoot: string): DevStatus {
     stateExists: existsSync(getStateFilePath(workspaceRoot)),
     tools,
     packages,
-    linked: linkedCount === packages.length,
+    linked: packages.length > 0 && linkedCount === packages.length,
     partiallyLinked: linkedCount > 0 && linkedCount < packages.length,
     staleMirror: staleMirrorCount > 0,
     legacyDirectLinked: legacyDirectLinkedCount > 0,
@@ -433,7 +456,11 @@ export function linkSdkToDemo(workspaceRoot: string, options: LinkOptions = {}):
   ensureSdkPackageBuildOutputs(afterBuild);
   const versions = getWorkspacePackageVersions(afterBuild);
 
-  const scopeDir = path.join(afterBuild.demo.resolvedPath, 'node_modules', '@flopay');
+  const devLink = getDevLinkConfig(workspaceRoot);
+  if (!devLink) {
+    throw new Error('SDK-to-demo linking is not configured. Set defaults.npm_scope and defaults.dev_link_packages in repos.yaml.');
+  }
+  const scopeDir = path.join(afterBuild.demo.resolvedPath, 'node_modules', devLink.scope);
   mkdirSync(scopeDir, { recursive: true });
 
   for (const packageLink of afterBuild.packages) {

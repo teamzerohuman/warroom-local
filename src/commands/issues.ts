@@ -612,7 +612,7 @@ function buildIssueCreatePrompt(workspaceRoot: string, draftPath: string, option
     '- The CLI will preview and create the GitHub issue; do not create it yourself.',
     '- JSON schema:',
     '{',
-    '  "repo": "TeamFloPay/<repo>",',
+    '  "repo": "<owner>/<repo>",',
     '  "title": "Short client-safe issue title",',
     '  "body": "Markdown body focused on business scope, observed behavior, desired outcome, known links, constraints, and open questions for triage.",',
     '  "labels": ["optional-domain-or-client-label"],',

@@ -80,6 +80,16 @@ const RepoManifestSchema = z.object({
     clone_protocol: z.string(),
     default_branch: z.string(),
     local_root: z.string(),
+    // Optional project-wide settings. Absent in the generic template; each
+    // consuming project sets the ones it needs in its own (gitignored)
+    // repos.yaml so War Room itself stays project-agnostic.
+    campaign_owner: z.string().optional(),
+    campaign_project_number: z.number().int().positive().optional(),
+    npm_scope: z.string().optional(),
+    dev_link_packages: z.array(z.string()).optional(),
+    e2e_backend_base_url: z.string().optional(),
+    e2e_demo_base_url: z.string().optional(),
+    e2e_local_host_suffix: z.string().optional(),
   }),
   repos: z.array(RepoSchema),
 });
@@ -173,6 +183,51 @@ export function loadRepoManifest(workspaceRoot: string): RepoManifest {
 export function writeRepoManifest(workspaceRoot: string, manifest: RepoManifest) {
   const manifestPath = path.join(workspaceRoot, 'repos.yaml');
   writeFileSync(manifestPath, YAML.stringify(manifest));
+}
+
+export type ProjectConfig = {
+  owner: string;
+  campaignOwner: string;
+  campaignProjectNumber: number;
+  npmScope: string | null;
+  devLinkPackages: string[];
+  e2eBackendBaseUrl: string;
+  e2eDemoBaseUrl: string;
+  e2eLocalHostSuffix: string | null;
+};
+
+// Parses WARROOM_CAMPAIGN_PROJECT as a positive integer. Returns undefined when
+// unset; throws when set to a non-numeric, non-integer, or non-positive value
+// so a bad env var fails loudly instead of leaking `NaN` into gh CLI calls.
+export function parseCampaignProjectEnv(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`WARROOM_CAMPAIGN_PROJECT must be a positive integer (got "${raw}").`);
+  }
+  return parsed;
+}
+
+// Resolves project-wide settings from repos.yaml `defaults`, with environment
+// overrides and generic fallbacks so War Room runs out of the box in any
+// project. The campaign GitHub Project owner defaults to the repo owner.
+export function resolveProjectConfig(defaults: RepoManifest['defaults']): ProjectConfig {
+  const env = process.env;
+  const envProject = parseCampaignProjectEnv(env.WARROOM_CAMPAIGN_PROJECT);
+  return {
+    owner: defaults.owner,
+    campaignOwner: env.WARROOM_CAMPAIGN_OWNER ?? defaults.campaign_owner ?? defaults.owner,
+    campaignProjectNumber: envProject ?? defaults.campaign_project_number ?? 1,
+    npmScope: defaults.npm_scope ?? null,
+    devLinkPackages: defaults.dev_link_packages ?? [],
+    e2eBackendBaseUrl: defaults.e2e_backend_base_url ?? 'https://localhost:3000',
+    e2eDemoBaseUrl: defaults.e2e_demo_base_url ?? 'https://localhost:3000',
+    e2eLocalHostSuffix: defaults.e2e_local_host_suffix ?? null,
+  };
+}
+
+export function getProjectConfig(workspaceRoot: string): ProjectConfig {
+  return resolveProjectConfig(loadRepoManifest(workspaceRoot).defaults);
 }
 
 export function absolutePath(workspaceRoot: string, maybeRelativePath: string) {

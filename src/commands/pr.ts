@@ -22,7 +22,8 @@ import {
   type LlmUsageSummary,
 } from '../lib/llm-usage.js';
 import { parseRepoRef } from '../lib/refs.js';
-import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
+import { getProjectConfig, getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
+import { findWarRoomWorkspace } from '../lib/workspace.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 import {
   assignSelfToIssue,
@@ -345,8 +346,22 @@ export type PrReviewQueueOptions = {
 const REVIEW_QUEUE_STATUSES: CampaignStatusName[] = ['battlefield-active', 'skirmish'];
 const DEFAULT_BACKEND_COMMAND = 'npm run start:api';
 const DEFAULT_DEMO_E2E_COMMAND = 'npm run test:e2e';
-const DEFAULT_BACKEND_BASE_URL = 'https://api.local.flopay.com';
-const DEFAULT_DEMO_BASE_URL = 'https://demo.local.flopay.com';
+const DEFAULT_BACKEND_BASE_URL = 'https://localhost:3000';
+const DEFAULT_DEMO_BASE_URL = 'https://localhost:3000';
+
+// Project e2e settings come from repos.yaml `defaults` (e2e_backend_base_url,
+// e2e_demo_base_url, e2e_local_host_suffix). Callers thread an explicit
+// workspaceRoot so we resolve the correct workspace's config; only when none
+// is available do we fall back to discovering one from process.cwd(). Env
+// vars (WARROOM_MERGE_*) still take precedence. Returns null when neither a
+// passed workspaceRoot nor a discoverable workspace is available.
+function projectE2EConfig(workspaceRoot?: string) {
+  try {
+    return getProjectConfig(workspaceRoot ?? findWarRoomWorkspace());
+  } catch {
+    return null;
+  }
+}
 const DEFAULT_BACKEND_READY_PATH = '/v1/health';
 const DEFAULT_BACKEND_READY_PROBE_TIMEOUT_MS = 3_000;
 const DEFAULT_BACKEND_READY_TIMEOUT_MS = 120_000;
@@ -3286,9 +3301,10 @@ function urlWithPath(baseUrl: string, pathPart: string) {
   }
 }
 
-function mergeE2EConfig() {
-  const billingApiUrl = envValue('WARROOM_MERGE_BACKEND_BASE_URL', DEFAULT_BACKEND_BASE_URL).replace(/\/+$/, '');
-  const demoBaseUrl = envValue('WARROOM_MERGE_DEMO_BASE_URL', DEFAULT_DEMO_BASE_URL).replace(/\/+$/, '');
+function mergeE2EConfig(workspaceRoot?: string) {
+  const e2e = projectE2EConfig(workspaceRoot);
+  const billingApiUrl = envValue('WARROOM_MERGE_BACKEND_BASE_URL', e2e?.e2eBackendBaseUrl ?? DEFAULT_BACKEND_BASE_URL).replace(/\/+$/, '');
+  const demoBaseUrl = envValue('WARROOM_MERGE_DEMO_BASE_URL', e2e?.e2eDemoBaseUrl ?? DEFAULT_DEMO_BASE_URL).replace(/\/+$/, '');
   const readyPath = envValue('WARROOM_MERGE_BACKEND_READY_PATH', DEFAULT_BACKEND_READY_PATH);
   const timeout = Number(envValue('WARROOM_MERGE_BACKEND_READY_TIMEOUT_MS', String(DEFAULT_BACKEND_READY_TIMEOUT_MS)));
   const probeTimeout = Number(
@@ -3311,7 +3327,7 @@ function createMergeE2EPlan(
   workspaceRoot: string,
   requirement: { required: boolean; skipReason: string | null }
 ): MergeE2EResult {
-  const config = mergeE2EConfig();
+  const config = mergeE2EConfig(workspaceRoot);
   if (!requirement.required) {
     return {
       status: 'skipped',
@@ -3421,32 +3437,31 @@ function booleanEnv(name: string, fallback: boolean) {
   return ['1', 'true', 'yes', 'on'].includes(value);
 }
 
-function isLocalHealthHostname(hostname: string) {
+function isLocalHealthHostname(hostname: string, workspaceRoot?: string) {
   const normalized = hostname.toLowerCase().replace(/^\[/, '').replace(/\]$/, '');
-  return (
-    normalized === 'localhost' ||
-    normalized === '127.0.0.1' ||
-    normalized === '::1' ||
-    normalized === 'local.flopay.com' ||
-    normalized.endsWith('.local.flopay.com')
-  );
+  if (normalized === 'localhost' || normalized === '127.0.0.1' || normalized === '::1') return true;
+  // Projects can mark a custom local domain (e.g. local.example.com) as a
+  // trusted local health host via repos.yaml defaults.e2e_local_host_suffix.
+  const suffix = (process.env.WARROOM_MERGE_LOCAL_HOST_SUFFIX ?? projectE2EConfig(workspaceRoot)?.e2eLocalHostSuffix ?? '').toLowerCase();
+  if (!suffix) return false;
+  return normalized === suffix || normalized.endsWith(`.${suffix}`);
 }
 
-function shouldAllowInsecureLocalTls(url: URL) {
+function shouldAllowInsecureLocalTls(url: URL, workspaceRoot?: string) {
   return (
     url.protocol === 'https:' &&
-    isLocalHealthHostname(url.hostname) &&
+    isLocalHealthHostname(url.hostname, workspaceRoot) &&
     booleanEnv('WARROOM_MERGE_BACKEND_ALLOW_INSECURE_LOCAL_TLS', true) &&
     !booleanEnv('WARROOM_MERGE_BACKEND_STRICT_TLS', false)
   );
 }
 
-function shouldUseSystemCaForDemoBackend(baseUrl: string) {
+function shouldUseSystemCaForDemoBackend(baseUrl: string, workspaceRoot?: string) {
   try {
     const url = new URL(baseUrl);
     return (
       url.protocol === 'https:' &&
-      isLocalHealthHostname(url.hostname) &&
+      isLocalHealthHostname(url.hostname, workspaceRoot) &&
       booleanEnv('WARROOM_MERGE_DEMO_USE_SYSTEM_CA', true) &&
       process.allowedNodeEnvironmentFlags.has(NODE_USE_SYSTEM_CA_FLAG)
     );
@@ -3467,7 +3482,7 @@ function formatProbeFailure(probe: BackendHealthProbeResult | null) {
   return '';
 }
 
-async function probeBackendHealth(url: string, timeoutMs: number): Promise<BackendHealthProbeResult> {
+async function probeBackendHealth(url: string, timeoutMs: number, workspaceRoot?: string): Promise<BackendHealthProbeResult> {
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(url);
@@ -3485,7 +3500,7 @@ async function probeBackendHealth(url: string, timeoutMs: number): Promise<Backe
     },
   };
 
-  if (shouldAllowInsecureLocalTls(parsedUrl)) {
+  if (shouldAllowInsecureLocalTls(parsedUrl, workspaceRoot)) {
     requestOptions.rejectUnauthorized = false;
     if (isIP(parsedUrl.hostname) === 0) requestOptions.servername = parsedUrl.hostname;
   }
@@ -3521,7 +3536,8 @@ async function waitForBackendReady(
   timeoutMs: number,
   probeTimeoutMs: number,
   backend: ChildProcess,
-  backendOutput: () => string
+  backendOutput: () => string,
+  workspaceRoot?: string
 ) {
   const startedAt = Date.now();
   let lastProbe: BackendHealthProbeResult | null = null;
@@ -3530,7 +3546,7 @@ async function waitForBackendReady(
       throw new Error(`Backend exited before becoming ready.${backendOutput() ? `\n${backendOutput()}` : ''}`);
     }
 
-    lastProbe = await probeBackendHealth(url, probeTimeoutMs);
+    lastProbe = await probeBackendHealth(url, probeTimeoutMs, workspaceRoot);
     if (lastProbe.ok) return;
 
     await delay(1_000);
@@ -3567,8 +3583,8 @@ function backendStartupDiagnostic(message: string, backendPath: string, readyUrl
   return lines.filter((line): line is string => Boolean(line)).join('\n');
 }
 
-async function isBackendReady(url: string, timeoutMs = DEFAULT_BACKEND_READY_PROBE_TIMEOUT_MS) {
-  return (await probeBackendHealth(url, timeoutMs)).ok;
+async function isBackendReady(url: string, timeoutMs = DEFAULT_BACKEND_READY_PROBE_TIMEOUT_MS, workspaceRoot?: string) {
+  return (await probeBackendHealth(url, timeoutMs, workspaceRoot)).ok;
 }
 
 function runShellCommand(
@@ -3596,10 +3612,11 @@ function runShellCommand(
 async function runDemoE2E(
   demoPath: string,
   config: ReturnType<typeof mergeE2EConfig>,
-  output: Pick<PrOptions, 'e2eOutput' | 'e2eStatus'>
+  output: Pick<PrOptions, 'e2eOutput' | 'e2eStatus'>,
+  workspaceRoot?: string
 ) {
   output.e2eStatus?.(`Demo Playwright e2e: running \`${config.demoCommand}\` from ${demoPath}`);
-  const useSystemCa = shouldUseSystemCaForDemoBackend(config.billingApiUrl);
+  const useSystemCa = shouldUseSystemCaForDemoBackend(config.billingApiUrl, workspaceRoot);
   if (useSystemCa) {
     output.e2eStatus?.(`Demo Playwright e2e: enabling Node system CA trust for ${config.billingApiUrl}`);
   }
@@ -3631,7 +3648,7 @@ export async function runMergeE2E(
   if (!plan.required) return plan;
   if (plan.blocked.length > 0) return { ...plan, status: 'failed', error: plan.blocked.join(' ') };
 
-  const config = mergeE2EConfig();
+  const config = mergeE2EConfig(workspaceRoot);
   const backendPort = baseUrlPort(config.billingApiUrl);
   const backend = repoHealthById(workspaceRoot, 'backend');
   const demo = repoHealthById(workspaceRoot, 'demo');
@@ -3641,10 +3658,10 @@ export async function runMergeE2E(
 
   const startedAt = Date.now();
   output.e2eStatus?.(`Demo Playwright e2e: checking backend readiness at ${config.backendReadyUrl}`);
-  const existingBackendReady = await isBackendReady(config.backendReadyUrl, config.backendReadyProbeTimeoutMs);
+  const existingBackendReady = await isBackendReady(config.backendReadyUrl, config.backendReadyProbeTimeoutMs, workspaceRoot);
   if (existingBackendReady) {
     output.e2eStatus?.(`Demo Playwright e2e: reusing existing backend at ${config.backendReadyUrl}`);
-    const test = await runDemoE2E(demo.resolvedPath, config, output);
+    const test = await runDemoE2E(demo.resolvedPath, config, output, workspaceRoot);
     return {
       ...plan,
       status: test.status === 0 ? 'passed' : 'failed',
@@ -3679,10 +3696,11 @@ export async function runMergeE2E(
       config.backendReadyTimeoutMs,
       config.backendReadyProbeTimeoutMs,
       backendProcess,
-      backendLogs
+      backendLogs,
+      workspaceRoot
     );
     output.e2eStatus?.(`Demo Playwright e2e: backend ready at ${config.backendReadyUrl}`);
-    const test = await runDemoE2E(demo.resolvedPath, config, output);
+    const test = await runDemoE2E(demo.resolvedPath, config, output, workspaceRoot);
 
     return {
       ...plan,

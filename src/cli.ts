@@ -8,9 +8,21 @@ import { createInterface } from 'node:readline';
 import { runAbort, type AbortResult } from './commands/abort.js';
 import { runAlliesStatus, type AlliesStatus } from './commands/allies.js';
 import { runBootstrap, type BootstrapResult } from './commands/bootstrap.js';
+import {
+  runSetup,
+  scaffoldFromExample,
+  regenerateAtlas,
+  readManifestDefaults,
+  writeRepoManifestFromInputs,
+  SCAFFOLD_TARGETS,
+  type RepoDefaultsInput,
+  type RepoInput,
+  type SetupResult,
+} from './commands/setup.js';
 import { runCampaignStatus, runCampaignStatusCheck } from './commands/campaign.js';
 import { runCommitCreate, type CommitCreateResult } from './commands/commit-create.js';
 import {
+  isDevLinkAvailable,
   linkSdkToDemo,
   runDevStatus,
   type DevActionResult,
@@ -81,7 +93,7 @@ import { formatLlmUsageSummary, refreshIssueUsageLedgerCosts, summarizeIssueUsag
 import { pickCommandPath } from './lib/interactive-menu.js';
 import { selectChoice } from './lib/prompt.js';
 import { loadRepoManifest, runGit } from './lib/repos.js';
-import { findWarRoomWorkspace } from './lib/workspace.js';
+import { findWarRoomRoot, findWarRoomWorkspace } from './lib/workspace.js';
 
 type Output = (text: string) => void;
 type Input = NodeJS.ReadableStream & { isTTY?: boolean };
@@ -94,6 +106,8 @@ type BuildProgramOptions = {
 };
 
 const OUTCOME_SEPARATOR = '-----------------------------------------';
+const DEV_LINK_UNAVAILABLE =
+  'SDK-to-demo dev link is not configured for this project. Set defaults.npm_scope and defaults.dev_link_packages in repos.yaml and map `sdk` and `demo` repos.';
 
 function printJson(output: Output, value: unknown) {
   output(JSON.stringify(value, null, 2));
@@ -134,6 +148,164 @@ function printSync(output: Output, result: SyncResult) {
     output(`${repo.state} ${repo.repo} ${repo.branch ?? 'no-branch'}@${repo.headSha ?? 'unknown'} -> ${repo.path}`);
     if (repo.detail) output(repo.detail);
   }
+}
+
+function printSetup(output: Output, result: SetupResult) {
+  output(`War Room setup: ${result.ok ? 'ok' : 'needs attention'}${result.initializedBefore ? '' : ' (initializing)'}`);
+  for (const action of result.scaffolded) {
+    output(`${action.state} ${action.target}${action.detail ? ` (${action.detail})` : ''}`);
+  }
+  output(`Campaign atlas: ${result.atlas.state}${result.atlas.detail ? ` (${result.atlas.detail})` : ''}`);
+}
+
+async function promptRepoEntries(
+  output: Output,
+  input: Input,
+  defaults: RepoDefaultsInput
+): Promise<RepoInput[]> {
+  const repos: RepoInput[] = [];
+  for (;;) {
+    const more = repos.length === 0
+      ? await promptConfirmation(output, input, 'Add a repo to the manifest now? [Y/n]')
+      : await promptConfirmation(output, input, `Added ${repos.length} repo(s). Add another? [Y/n]`);
+    if (!more) break;
+
+    const id = await promptText(output, input, 'Repo id (short slug, e.g. "backend"):');
+    if (!id) {
+      output('Skipped: a repo id is required.');
+      continue;
+    }
+    const github = await promptText(output, input, `GitHub slug [${defaults.owner}/${id}]:`);
+    const description = await promptText(output, input, 'One-line description (optional):');
+    const sergeant = await promptText(output, input, `Sergeant name [${id} Sergeant]:`);
+    const status = await selectChoice<'active' | 'planned'>({
+      output,
+      input,
+      question: 'Status: active (cloned by bootstrap) or planned (skipped)?',
+      default: 'active',
+      choices: [
+        { label: 'Active', value: 'active', aliases: ['a'] },
+        { label: 'Planned', value: 'planned', aliases: ['p'] },
+      ],
+      retryHelp: 'Enter active or planned.',
+    });
+
+    repos.push({
+      id,
+      github: github || undefined,
+      description: description || undefined,
+      sergeant: sergeant || undefined,
+      status,
+    });
+    output(`Queued ${github || `${defaults.owner}/${id}`} (${status}).`);
+  }
+  return repos;
+}
+
+async function runInteractiveSetup(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  opts: { force?: boolean }
+) {
+  output('War Room setup — generating project-specific config from templates.');
+  output('');
+
+  // 1. repos.yaml — the required manifest.
+  const reposPath = path.join(workspaceRoot, 'repos.yaml');
+  if (existsSync(reposPath) && !opts.force) {
+    output('repos.yaml already exists — leaving it unchanged (use --force to rebuild).');
+  } else {
+    const mode = await selectChoice<'interactive' | 'template' | 'skip'>({
+      output,
+      input,
+      question: 'Build repos.yaml interactively, copy the example template, or skip?',
+      default: 'interactive',
+      choices: [
+        { label: 'Build interactively', value: 'interactive', aliases: ['i', 'build'] },
+        { label: 'Copy example template', value: 'template', aliases: ['t', 'copy', 'example'] },
+        { label: 'Skip', value: 'skip', aliases: ['s'] },
+      ],
+      retryHelp: 'Enter interactive, template, or skip.',
+    });
+
+    if (mode === 'template') {
+      const action = scaffoldFromExample(workspaceRoot, 'repos.yaml', 'repos.example.yaml', true);
+      output(`${action.state} repos.yaml${action.detail ? ` (${action.detail})` : ''} — edit it, then re-run setup or \`warroom bootstrap\`.`);
+    } else if (mode === 'interactive') {
+      const exampleDefaults = readManifestDefaults(workspaceRoot) ?? {
+        owner: 'your-org',
+        clone_protocol: 'ssh',
+        default_branch: 'main',
+        local_root: 'maps/repos',
+      };
+      const owner = (await promptText(output, input, `GitHub owner/org [${exampleDefaults.owner}]:`)) || exampleDefaults.owner;
+      const protocol = await selectChoice<'ssh' | 'https'>({
+        output,
+        input,
+        question: 'Clone protocol?',
+        default: exampleDefaults.clone_protocol === 'https' ? 'https' : 'ssh',
+        choices: [
+          { label: 'SSH', value: 'ssh' },
+          { label: 'HTTPS', value: 'https' },
+        ],
+        retryHelp: 'Enter ssh or https.',
+      });
+      const defaultBranch = (await promptText(output, input, `Default branch [${exampleDefaults.default_branch}]:`)) || exampleDefaults.default_branch;
+      const defaults: RepoDefaultsInput = {
+        owner,
+        clone_protocol: protocol,
+        default_branch: defaultBranch,
+        local_root: exampleDefaults.local_root || 'maps/repos',
+      };
+
+      const repos = await promptRepoEntries(output, input, defaults);
+      try {
+        writeRepoManifestFromInputs(workspaceRoot, defaults, repos);
+        output(`Wrote repos.yaml with ${repos.length} repo(s).`);
+      } catch (error) {
+        output(`Failed to write a valid repos.yaml: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
+    } else {
+      output('Skipped repos.yaml — War Room needs it before other commands work.');
+    }
+  }
+
+  // 2. Optional companion files, scaffolded from templates if missing.
+  for (const entry of SCAFFOLD_TARGETS) {
+    if (entry.target === 'repos.yaml') continue;
+    const targetPath = path.join(workspaceRoot, entry.target);
+    if (existsSync(targetPath) && !opts.force) continue;
+    if (!existsSync(path.join(workspaceRoot, entry.example))) continue;
+    const create = await promptConfirmation(output, input, `Create ${entry.target} from ${entry.example}? [Y/n]`);
+    if (!create) continue;
+    const action = scaffoldFromExample(workspaceRoot, entry.target, entry.example, opts.force);
+    output(`${action.state} ${entry.target}${action.detail ? ` (${action.detail})` : ''}`);
+  }
+
+  // 3. Campaign atlas, generated from the finished manifest.
+  if (existsSync(reposPath)) {
+    const regen = await promptConfirmation(output, input, 'Generate maps/campaign-atlas.md from repos.yaml now? [Y/n]');
+    if (regen) {
+      const atlas = regenerateAtlas(workspaceRoot);
+      output(`Campaign atlas: ${atlas.state}${atlas.detail ? ` (${atlas.detail})` : ''}`);
+    }
+  }
+
+  // 4. Offer to clone the active repos.
+  if (existsSync(reposPath)) {
+    const clone = await promptConfirmation(output, input, 'Clone active repos now (runs `warroom bootstrap`)? [y/N]');
+    if (clone) {
+      const result = runBootstrap(workspaceRoot, {});
+      printBootstrap(output, result);
+    } else {
+      output('Run `warroom bootstrap` later to clone the mapped repos.');
+    }
+  }
+
+  output('');
+  output('Setup complete. Next: `warroom doctor` to validate the workspace.');
 }
 
 function printAlliesStatus(output: Output, result: AlliesStatus) {
@@ -211,7 +383,7 @@ async function ensureAllyImplementationRepo(
 
   if (!interactive) {
     output(
-      `Ally issue ${ref.repo}#${ref.number} has no implementation repo declared. Re-run interactively, or add a comment like \`Owner repo: TeamFloPay/<mapped-repo>\` on the issue.`
+      `Ally issue ${ref.repo}#${ref.number} has no implementation repo declared. Re-run interactively, or add a comment like \`Owner repo: <owner>/<mapped-repo>\` on the issue.`
     );
     return false;
   }
@@ -1706,7 +1878,20 @@ function printDevTest(output: Output, result: MergeE2EResult) {
 export function buildProgram(options: BuildProgramOptions = {}) {
   resetCampaignCache();
   const invocationCwd = options.cwd ?? process.cwd();
-  const workspaceRoot = findWarRoomWorkspace(invocationCwd);
+  // Resolve the initialized workspace when possible, but fall back to the War
+  // Room checkout root so `setup` can run before `repos.yaml` exists. Commands
+  // that require an initialized workspace surface a clear error when they load
+  // the manifest.
+  let workspaceRoot: string;
+  try {
+    workspaceRoot = findWarRoomWorkspace(invocationCwd);
+  } catch (error) {
+    try {
+      workspaceRoot = findWarRoomRoot(invocationCwd);
+    } catch {
+      throw error;
+    }
+  }
   const output = options.output ?? console.log;
   const customOutput = options.output !== undefined;
   const input = options.input ?? process.stdin;
@@ -1720,7 +1905,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
   program
     .name('warroom')
-    .description('TeamFloPay local command center and cross-repo orchestration workspace.')
+    .description('Local command center and cross-repo orchestration workspace.')
     .version('0.1.0')
     .helpOption('-h, --help, -help', 'Display help.')
     .showHelpAfterError();
@@ -1792,8 +1977,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         const branch = repo.branch ? ` ${repo.branch}@${repo.headSha ?? 'unknown'}` : '';
         output(`${repo.github} [${repo.status}, ${checkoutState}${dirty}${branch}] -> ${repo.resolvedPath} (${repo.specialist.name})`);
       }
-      const devStatus = runDevStatus(workspaceRoot);
-      output(`SDK-to-demo dev link: ${devStatus.linked ? 'linked' : devStatus.partiallyLinked ? 'partially linked' : 'unlinked'}`);
+      if (isDevLinkAvailable(workspaceRoot)) {
+        const devStatus = runDevStatus(workspaceRoot);
+        output(`SDK-to-demo dev link: ${devStatus.linked ? 'linked' : devStatus.partiallyLinked ? 'partially linked' : 'unlinked'}`);
+      }
     });
 
   maps
@@ -1873,6 +2060,27 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       printSync(output, result);
+    });
+
+  program
+    .command('setup')
+    .description('Initialize project-specific config (repos.yaml, allies.yaml, .env.local, maps) from templates.')
+    .option('--yes', 'Non-interactive: scaffold all missing files from their templates.')
+    .option('--force', 'Overwrite existing files from their templates.')
+    .option('--atlas', 'Regenerate maps/campaign-atlas.md after scaffolding (with --yes).')
+    .option('--json', 'Print machine-readable output (implies --yes).')
+    .action(async (opts: { yes?: boolean; force?: boolean; atlas?: boolean; json?: boolean }) => {
+      if (opts.yes || opts.json || !interactive) {
+        const result = runSetup(workspaceRoot, { force: opts.force, regenerateAtlas: opts.atlas });
+        if (opts.json) {
+          printJson(output, result);
+        } else {
+          printSetup(output, result);
+        }
+        if (!result.ok) process.exitCode = 1;
+        return;
+      }
+      await runInteractiveSetup(workspaceRoot, output, input, { force: opts.force });
     });
 
   const campaign = program.command('campaign').description('Campaign Map setup and status commands.');
@@ -1970,7 +2178,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
   issue
     .command('fortify')
     .description('Post-MVP quality/refactor issue creation flow.')
-    .action(() => output('warroom issue fortify is deferred from the MVP and tracked in TeamFloPay/infra#7.'));
+    .action(() => output('warroom issue fortify is deferred from the MVP.'));
   issue
     .command('usage')
     .description('Print War Room LLM usage tracked for an issue.')
@@ -2192,7 +2400,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
               } else {
                 printOutcome(
                   output,
-                  'Outcome: not started. Ally issue has no implementation repo. Re-run interactively or add an `Owner repo: TeamFloPay/<mapped-repo>` comment, then retry.'
+                  'Outcome: not started. Ally issue has no implementation repo. Re-run interactively or add an `Owner repo: <owner>/<mapped-repo>` comment, then retry.'
                 );
               }
               process.exitCode = 1;
@@ -2252,7 +2460,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           if (!ensured) {
             printOutcome(
               output,
-              'Outcome: not started. Ally issue has no implementation repo. Pick a repo when prompted or add an `Owner repo: TeamFloPay/<mapped-repo>` comment, then retry.'
+              'Outcome: not started. Ally issue has no implementation repo. Pick a repo when prompted or add an `Owner repo: <owner>/<mapped-repo>` comment, then retry.'
             );
             process.exitCode = 1;
             return;
@@ -2723,6 +2931,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .description('Show SDK-to-demo local dev-link state and prerequisites.')
     .option('--json', 'Print machine-readable output.')
     .action((opts: { json?: boolean }) => {
+      if (!isDevLinkAvailable(workspaceRoot)) {
+        output(DEV_LINK_UNAVAILABLE);
+        return;
+      }
       const result = runDevStatus(workspaceRoot);
       if (opts.json) {
         printJson(output, result);
@@ -2738,6 +2950,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--skip-build', 'Do not build SDK packages before linking.')
     .option('--json', 'Print machine-readable output.')
     .action((opts: { skipBuild?: boolean; json?: boolean }) => {
+      if (!isDevLinkAvailable(workspaceRoot)) {
+        output(DEV_LINK_UNAVAILABLE);
+        return;
+      }
       const result = linkSdkToDemo(workspaceRoot, { skipBuild: opts.skipBuild });
       if (opts.json) {
         printJson(output, result);
@@ -2752,6 +2968,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--skip-install', 'Do not run pnpm install after removing local links.')
     .option('--json', 'Print machine-readable output.')
     .action((opts: { skipInstall?: boolean; json?: boolean }) => {
+      if (!isDevLinkAvailable(workspaceRoot)) {
+        output(DEV_LINK_UNAVAILABLE);
+        return;
+      }
       const result = unlinkSdkFromDemo(workspaceRoot, { skipInstall: opts.skipInstall });
       if (opts.json) {
         printJson(output, result);

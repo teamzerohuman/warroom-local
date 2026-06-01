@@ -1,8 +1,27 @@
 import { spawnSync } from 'node:child_process';
 import { parseRepoRef } from './refs.js';
+import { getProjectConfig, parseCampaignProjectEnv } from './repos.js';
+import { findWarRoomWorkspace } from './workspace.js';
 
-export const CAMPAIGN_OWNER = 'TeamFloPay';
-export const CAMPAIGN_PROJECT_NUMBER = 1;
+// The campaign GitHub Project owner/number come from repos.yaml `defaults`
+// (campaign_owner falls back to the repo owner; project number defaults to 1),
+// overridable via WARROOM_CAMPAIGN_OWNER / WARROOM_CAMPAIGN_PROJECT.
+export function campaignTarget(): { owner: string; project: number } {
+  const env = process.env;
+  const envOwner = env.WARROOM_CAMPAIGN_OWNER;
+  const envProject = parseCampaignProjectEnv(env.WARROOM_CAMPAIGN_PROJECT);
+  if (envOwner && envProject !== undefined) return { owner: envOwner, project: envProject };
+  try {
+    const config = getProjectConfig(findWarRoomWorkspace());
+    return {
+      owner: envOwner ?? config.campaignOwner,
+      project: envProject ?? config.campaignProjectNumber,
+    };
+  } catch {
+    return { owner: envOwner ?? 'your-org', project: envProject ?? 1 };
+  }
+}
+
 const PROJECT_ITEM_LIST_RECENT_LIMIT = '200';
 const PROJECT_ITEM_LIST_FALLBACK_LIMIT = '2000';
 const RATE_LIMIT_RETRY_DELAY_MS = 30_000;
@@ -116,10 +135,11 @@ function ghJson<T>(args: string[], fallback: T): T {
 function projectView() {
   ensureCacheForCurrentPath();
   if (cache.projectView !== undefined) return cache.projectView;
+  const target = campaignTarget();
   cache.projectView = ghJson<{
     id?: string;
     title?: string;
-  }>(['project', 'view', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json'], {});
+  }>(['project', 'view', String(target.project), '--owner', target.owner, '--format', 'json'], {});
   return cache.projectView;
 }
 
@@ -133,7 +153,7 @@ function projectStatusField() {
       type: string;
       options?: Array<{ id: string; name: string }>;
     }>;
-  }>(['project', 'field-list', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json'], {});
+  }>(['project', 'field-list', String(campaignTarget().project), '--owner', campaignTarget().owner, '--format', 'json'], {});
 
   cache.statusField = fields.fields?.find((field) => field.name === 'Status' && field.type === 'ProjectV2SingleSelectField') ?? null;
   return cache.statusField;
@@ -141,7 +161,8 @@ function projectStatusField() {
 
 function fetchProjectItems(scope: 'recent' | 'fallback'): ProjectItem[] {
   const limit = scope === 'recent' ? PROJECT_ITEM_LIST_RECENT_LIMIT : PROJECT_ITEM_LIST_FALLBACK_LIMIT;
-  const args = ['project', 'item-list', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json', '--limit', limit];
+  const target = campaignTarget();
+  const args = ['project', 'item-list', String(target.project), '--owner', target.owner, '--format', 'json', '--limit', limit];
   const response = ghJson<{ items?: ProjectItem[] }>(args, {});
   return response.items ?? [];
 }
@@ -161,7 +182,10 @@ export function checkCampaignStatusOptions(): CampaignStatusReport {
   const project = projectView();
   const field = projectStatusField();
 
-  if (!project.id) errors.push(`Could not load TeamFloPay Project ${CAMPAIGN_PROJECT_NUMBER}.`);
+  if (!project.id) {
+    const target = campaignTarget();
+    errors.push(`Could not load ${target.owner} Project ${target.project}.`);
+  }
   if (!field) errors.push('Could not load Campaign Map Status field.');
 
   const options = field?.options ?? [];
@@ -236,8 +260,9 @@ function ensureProjectItem(issue: string): { item: { id: string; content: { repo
 
   const ref = parseIssueRef(issue);
   const url = `https://github.com/${ref.repo}/issues/${ref.number}`;
+  const target = campaignTarget();
   const added = ghJson<{ id?: string }>(
-    ['project', 'item-add', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--url', url, '--format', 'json'],
+    ['project', 'item-add', String(target.project), '--owner', target.owner, '--url', url, '--format', 'json'],
     {}
   );
   if (!added.id) throw new Error(`Could not add ${issue} to Campaign Map.`);

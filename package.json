@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "TeamFloPay local command center and cross-repo orchestration workspace.",
+  "description": "Local command center and cross-repo orchestration workspace.",
   "bin": {
     "warroom": "./dist/src/cli.js"
   },

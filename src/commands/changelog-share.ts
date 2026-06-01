@@ -201,7 +201,7 @@ function generateContent(
   const prompt = [
     'Respond with valid JSON only — no markdown fences, no preamble, no explanation.',
     '',
-    feedback ? 'Revise this Slack changelog message based on user feedback.' : 'Generate Slack message copy for a FloPay changelog distribution.',
+    feedback ? 'Revise this Slack changelog message based on user feedback.' : 'Generate Slack message copy for a changelog distribution.',
     '',
     `Period: ${periodLabel}`,
     'Changelog entries:',

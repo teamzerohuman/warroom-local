@@ -3713,6 +3713,8 @@ defaults:
   clone_protocol: ssh
   default_branch: main
   local_root: maps/repos
+  npm_scope: "@flopay"
+  dev_link_packages: [shared, js, react, node]
 repos:
   - id: sdk
     name: sdk
@@ -3838,6 +3840,8 @@ defaults:
   clone_protocol: ssh
   default_branch: main
   local_root: maps/repos
+  npm_scope: "@flopay"
+  dev_link_packages: [shared, js, react, node]
 repos:
   - id: sdk
     name: sdk
