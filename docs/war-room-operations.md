@@ -23,7 +23,7 @@ Use `warroom maps assign --repo <id>` with framework/domain/resource flags for r
 
 ## Campaign Map
 
-TeamFloPay Project 1 is the Campaign Map. Current project statuses are `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`.
+The Campaign Map is a GitHub Project board. Current project statuses are `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`. Provision it with `warroom project create` (or wire an existing board with `warroom project link --project <number>`); both write `campaign_owner`/`campaign_project_number` into `repos.yaml`. `warroom setup` also offers this when `repos.yaml` has no `campaign_project_number`.
 
 Use `warroom campaign status-check` to validate board status options and `warroom campaign status --issue owner/repo#number --status <status> --confirm` to move an issue deliberately. Any status change adds the issue to the Campaign Map board if it is not already there. The Campaign Map Status field is the single source of truth for an issue's phase — no duplicate workflow labels are written on the repo.
 

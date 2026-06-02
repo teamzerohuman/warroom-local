@@ -20,6 +20,7 @@ import {
   type SetupResult,
 } from './commands/setup.js';
 import { runCampaignStatus, runCampaignStatusCheck } from './commands/campaign.js';
+import { runProjectCreate, runProjectLink, type ProjectSetupResult } from './commands/project.js';
 import { runCommitCreate, type CommitCreateResult } from './commands/commit-create.js';
 import {
   isDevLinkAvailable,
@@ -92,7 +93,7 @@ import { readWorkspaceEnvVar } from './lib/env.js';
 import { formatLlmUsageSummary, refreshIssueUsageLedgerCosts, summarizeIssueUsage, type LlmUsageSummary } from './lib/llm-usage.js';
 import { pickCommandPath } from './lib/interactive-menu.js';
 import { selectChoice } from './lib/prompt.js';
-import { loadRepoManifest, runGit } from './lib/repos.js';
+import { loadRepoManifest, readCampaignProjectNumber, runGit } from './lib/repos.js';
 import { findWarRoomRoot, findWarRoomWorkspace } from './lib/workspace.js';
 
 type Output = (text: string) => void;
@@ -293,7 +294,13 @@ async function runInteractiveSetup(
     }
   }
 
-  // 4. Offer to clone the active repos.
+  // 4. Campaign Map board — offered when repos.yaml has no campaign_project_number.
+  if (existsSync(reposPath) && readCampaignProjectNumber(workspaceRoot) === null) {
+    output('');
+    await promptCampaignProjectSetup(workspaceRoot, output, input);
+  }
+
+  // 5. Offer to clone the active repos.
   if (existsSync(reposPath)) {
     const clone = await promptConfirmation(output, input, 'Clone active repos now (runs `warroom bootstrap`)? [y/N]');
     if (clone) {
@@ -306,6 +313,52 @@ async function runInteractiveSetup(
 
   output('');
   output('Setup complete. Next: `warroom doctor` to validate the workspace.');
+}
+
+// Interactive Campaign Map board setup. Offered during `warroom setup` when
+// repos.yaml has no campaign_project_number, and reusable standalone. Returns
+// true when the manifest was wired to a board, false on skip/error.
+async function promptCampaignProjectSetup(
+  workspaceRoot: string,
+  output: Output,
+  input: Input
+): Promise<boolean> {
+  output('War Room drives a GitHub Project board (the Campaign Map). Would you like to:');
+  const choice = await selectChoice<'create' | 'existing' | 'skip'>({
+    output,
+    input,
+    question: 'Campaign Map board:',
+    default: 'create',
+    choices: [
+      { label: 'Create new project board', value: 'create', aliases: ['create', 'new', 'c'] },
+      { label: 'Use existing project board', value: 'existing', aliases: ['existing', 'use', 'e'] },
+      { label: 'Skip', value: 'skip', aliases: ['skip', 's'] },
+    ],
+    retryHelp: 'Enter create, existing, or skip.',
+  });
+
+  if (choice === 'skip') {
+    output('Skipped Campaign Map setup. Run `warroom project create` (or `project link`) later.');
+    return false;
+  }
+
+  if (choice === 'create') {
+    const title = (await promptText(output, input, 'Board name [Campaign Map]:')) || 'Campaign Map';
+    const result = runProjectCreate(workspaceRoot, { title, confirm: true });
+    printProjectSetup(output, result);
+    return result.applied;
+  }
+
+  // Use existing board.
+  const raw = await promptText(output, input, 'Existing GitHub Project number (e.g. 1):');
+  const projectNumber = Number(raw);
+  if (!Number.isInteger(projectNumber) || projectNumber < 1) {
+    output(`"${raw}" is not a valid project number. Run \`warroom project link --project <n>\` later.`);
+    return false;
+  }
+  const result = runProjectLink(workspaceRoot, { projectNumber, confirm: true });
+  printProjectSetup(output, result);
+  return result.applied;
 }
 
 function printAlliesStatus(output: Output, result: AlliesStatus) {
@@ -1798,6 +1851,16 @@ function printCampaignStatusCheck(output: Output, result: ReturnType<typeof runC
   for (const error of result.errors) output(`error: ${error}`);
 }
 
+function printProjectSetup(output: Output, result: ProjectSetupResult) {
+  const verb = result.mode === 'create' ? 'create' : 'link';
+  output(`Campaign Map project ${verb}: ${result.error ? 'failed' : result.applied ? 'applied' : 'planned'}`);
+  for (const message of result.messages) output(message);
+  if (result.error) output(`error: ${result.error}`);
+  if (result.applied) {
+    output('Verify with `warroom campaign status-check`.');
+  }
+}
+
 function printCampaignStatus(output: Output, result: ReturnType<typeof runCampaignStatus>) {
   output(`Campaign status: ${result.applied ? 'updated' : 'planned'} ${result.issue} -> ${result.status}`);
   output(`Project item: ${result.projectItemId}${result.added ? ' (added to board)' : ''}`);
@@ -2112,6 +2175,51 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       printCampaignStatus(output, result);
+    });
+
+  const project = program.command('project').description('Campaign Map GitHub Project board setup.');
+  project
+    .command('create')
+    .description('Create a new GitHub Project board, configure its Status field, and wire repos.yaml.')
+    .option('--title <title>', 'Board name (interactive setup prompts for this).')
+    .option('--owner <owner>', 'GitHub owner/org for the board. Defaults to the repos.yaml campaign owner.')
+    .option('--confirm', 'Actually create the board and update repos.yaml.')
+    .option('--json', 'Print machine-readable output.')
+    .action(async (opts: { title?: string; owner?: string; confirm?: boolean; json?: boolean }) => {
+      // No flags in an interactive terminal: run the full three-way menu.
+      if (!opts.json && interactive && !opts.title && !opts.owner && !opts.confirm) {
+        await promptCampaignProjectSetup(workspaceRoot, output, input);
+        return;
+      }
+      const title = opts.title ?? 'Campaign Map';
+      const result = runProjectCreate(workspaceRoot, { title, owner: opts.owner, confirm: opts.confirm });
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printProjectSetup(output, result);
+    });
+
+  project
+    .command('link')
+    .description('Point repos.yaml at an existing GitHub Project board and reconcile its Status field.')
+    .requiredOption('--project <number>', 'Existing GitHub Project number.', (value) => Number(value))
+    .option('--owner <owner>', 'GitHub owner/org for the board. Defaults to the repos.yaml campaign owner.')
+    .option('--no-ensure-status', 'Skip reconciling the board Status field to the Campaign Map states.')
+    .option('--confirm', 'Actually update repos.yaml (and the Status field unless --no-ensure-status).')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { project: number; owner?: string; ensureStatus?: boolean; confirm?: boolean; json?: boolean }) => {
+      const result = runProjectLink(workspaceRoot, {
+        projectNumber: opts.project,
+        owner: opts.owner,
+        ensureStatus: opts.ensureStatus,
+        confirm: opts.confirm,
+      });
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printProjectSetup(output, result);
     });
 
   const issue = program.command('issue').description('Issue workflow commands.');

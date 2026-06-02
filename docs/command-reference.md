@@ -10,6 +10,9 @@ warroom doctor
 warroom bootstrap --dry-run
 warroom bootstrap --dry-run --write-proposals
 warroom sync --report
+warroom project create
+warroom project create --title "Campaign Map" --owner your-org --confirm
+warroom project link --project 1 --owner your-org --confirm
 warroom campaign status-check
 warroom campaign status --issue TeamFloPay/infra#4 --status battlefield-active
 warroom allies status
@@ -50,6 +53,7 @@ After `npm run link:global`, `warroom` can be run from the War Room checkout or 
 
 - `bootstrap --dry-run` previews clone actions and inferred resource/allowlist proposals. Without `--dry-run`, missing active repos are cloned under ignored `maps/repos/*`. Resource proposal writes require `--write-proposals --confirm`.
 - `sync --report` does not fetch or pull. Without `--report`, sync skips dirty repos and only fast-forwards clean checkouts.
+- `project create` and `project link` preview their plan and make no GitHub or `repos.yaml` changes unless `--confirm` is present. In an interactive terminal, `project create` with no flags opens the create/use-existing/skip menu.
 - `campaign status` previews issue status movement unless `--confirm` is present. Moving to `blockaded` requires `--reason`. Any status change adds the issue to the Campaign Map board if it is not already on it.
 - Issue and PR handoff commands print scoped prompts by default, except interactive `issue next`, which launches the selected issue by default. Selected `issue next` launches are implementation starts, not preflight-only planning. Add `--dry-run` for preview mode.
 - Campaign Map status movement is guarded separately with `--confirm-status`, except interactive `issue next`, which moves the selected issue to `battlefield-active` by default. Add `--no-status` to skip that movement.
@@ -62,6 +66,10 @@ After `npm run link:global`, `warroom` can be run from the War Room checkout or 
 ## Command Notes
 
 `warroom doctor` validates files, `repos.yaml`, `allies.yaml`, `resources.yaml`, ally shared docs, resource references, LLM adapter shape, local repo health, local tool availability including `gh`, and Campaign Map Status field options.
+
+`warroom project create` provisions the Campaign Map board so War Room has a GitHub Project to drive. It runs `gh project create` under the resolved owner (the `--owner` flag, else `repos.yaml` `campaign_owner`/`owner`), then ensures the board's single-select `Status` field carries exactly the six Campaign Map states — deleting and recreating the default `Status` field (`Todo`/`In Progress`/`Done`) when its options do not match — and finally writes `campaign_owner` and `campaign_project_number` into `repos.yaml` `defaults` while preserving comments. Without `--confirm` it prints the plan only. In an interactive terminal with no flags it offers a three-way menu: create a new board, use an existing board (prompting for its project number, which routes to `project link`), or skip. The same prompt is offered during `warroom setup` when `repos.yaml` has no `campaign_project_number`.
+
+`warroom project link --project <number>` points `repos.yaml` at an existing GitHub Project board. It validates the board exists with `gh project view`, reconciles its `Status` field to the six Campaign Map states (pass `--no-ensure-status` to skip that), and writes `campaign_owner`/`campaign_project_number`. Without `--confirm` it prints the plan only.
 
 `warroom campaign status-check` validates the Campaign Map Status field options: `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`.
 

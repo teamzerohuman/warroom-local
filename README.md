@@ -52,6 +52,17 @@ Clone missing mapped child repos under ignored `maps/repos/*` when you are ready
 npm run warroom -- bootstrap
 ```
 
+Set up the Campaign Map board. War Room drives a GitHub Project (the Campaign Map); `warroom setup` offers this automatically when `repos.yaml` has no `campaign_project_number`, or run it directly:
+
+```sh
+npm run warroom -- project create            # interactive: create new / use existing / skip
+# or non-interactive:
+npm run warroom -- project create --title "Campaign Map" --owner your-org --confirm
+npm run warroom -- project link --project 1 --owner your-org --confirm   # wire an existing board
+```
+
+`project create` creates the board, configures its `Status` field with the six Campaign Map states, and writes `campaign_owner`/`campaign_project_number` into `repos.yaml`.
+
 Run the normal operating checks:
 
 ```sh

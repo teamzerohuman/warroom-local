@@ -35,6 +35,20 @@ Write the implementation plan back to the issue as a normal GitHub comment.
 
 ## Campaign Map
 
+War Room can provision the board for you with `warroom project create` (or wire an existing one with `warroom project link --project <number>`). To do it by hand:
+
+```sh
+gh project create --owner TeamFloPay --title "Campaign Map"
+# Replace the default Status field options with the six Campaign Map states:
+gh project field-list <number> --owner TeamFloPay   # find the default Status field id
+gh project field-delete --id <default-status-field-id>
+gh project field-create <number> --owner TeamFloPay --name "Status" --data-type SINGLE_SELECT \
+  --single-select-options "needs-triage,ready-to-engage,battlefield-active,skirmish,blockaded,victory"
+# Then set defaults.campaign_owner and defaults.campaign_project_number in repos.yaml.
+```
+
+Day-to-day board operations:
+
 ```sh
 gh project field-list 1 --owner TeamFloPay
 gh project item-list 1 --owner TeamFloPay --limit 100

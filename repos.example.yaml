@@ -14,6 +14,8 @@ defaults:
   # Optional project-wide settings. Uncomment/set the ones you use; War Room
   # falls back to generic defaults (campaign owner = `owner`, project number 1)
   # and the SDK-to-demo `dev link` feature stays off until npm_scope is set.
+  # The two campaign_* keys below are written for you by `warroom project create`
+  # (or `warroom project link`); set them by hand only if wiring a board manually.
   # campaign_owner: your-org           # GitHub org that owns the Campaign Map project
   # campaign_project_number: 1         # GitHub Project number for the Campaign Map
   # npm_scope: "@your-scope"           # npm scope for `warroom dev link` (sdk -> demo)

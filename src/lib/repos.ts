@@ -185,6 +185,45 @@ export function writeRepoManifest(workspaceRoot: string, manifest: RepoManifest)
   writeFileSync(manifestPath, YAML.stringify(manifest));
 }
 
+// Surgically set `defaults.campaign_owner` and `defaults.campaign_project_number`
+// in repos.yaml while preserving comments and the rest of the file. Used by
+// `warroom project create`/`project link` so wiring the Campaign Map board does
+// not rewrite or reformat the user's hand-edited manifest.
+export function updateCampaignProjectInManifest(
+  workspaceRoot: string,
+  campaignOwner: string,
+  campaignProjectNumber: number
+): void {
+  if (!Number.isInteger(campaignProjectNumber) || campaignProjectNumber < 1) {
+    throw new Error(`campaign_project_number must be a positive integer (got "${campaignProjectNumber}").`);
+  }
+  const manifestPath = path.join(workspaceRoot, 'repos.yaml');
+  if (!existsSync(manifestPath)) {
+    throw new Error('repos.yaml not found — run `warroom setup` before wiring a Campaign Map project.');
+  }
+  const doc = YAML.parseDocument(readFileSync(manifestPath, 'utf8'));
+  doc.setIn(['defaults', 'campaign_owner'], campaignOwner);
+  doc.setIn(['defaults', 'campaign_project_number'], campaignProjectNumber);
+  writeFileSync(manifestPath, doc.toString());
+}
+
+// Reads the raw `campaign_project_number` straight from repos.yaml `defaults`
+// without applying env overrides or the generic fallback of 1, so onboarding can
+// tell whether the user has actually wired a Campaign Map board yet.
+export function readCampaignProjectNumber(workspaceRoot: string): number | null {
+  const manifestPath = path.join(workspaceRoot, 'repos.yaml');
+  if (!existsSync(manifestPath)) return null;
+  try {
+    const parsed = YAML.parse(readFileSync(manifestPath, 'utf8')) as {
+      defaults?: { campaign_project_number?: unknown };
+    };
+    const value = parsed?.defaults?.campaign_project_number;
+    return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 export type ProjectConfig = {
   owner: string;
   campaignOwner: string;
